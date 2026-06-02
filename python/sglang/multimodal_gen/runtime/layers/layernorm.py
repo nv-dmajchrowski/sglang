@@ -849,6 +849,7 @@ class RMSNormTanhMulAdd(_NormTanhMulAdd):
     norm_type = "rms"
 
 
+@torch.compiler.disable
 def apply_qk_norm(
     q: torch.Tensor,
     k: torch.Tensor,
