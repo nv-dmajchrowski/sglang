@@ -1503,6 +1503,19 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         return (video_pred, *extra_outputs)
 
+        extra_outputs: list[torch.Tensor] = []
+        idx = s_video
+        if action_frames > 0:
+            action_hidden = hidden_gen[:, idx : idx + action_frames, :]
+            extra_outputs.append(self.action_proj_out(action_hidden, action_domain_ids))
+            idx += action_frames
+        if sound_frames > 0:
+            sound_hidden = hidden_gen[:, idx:, :]
+            sound_output, _ = self.audio_proj_out(sound_hidden)
+            extra_outputs.append(sound_output.permute(0, 2, 1).contiguous())
+
+        return (video_pred, *extra_outputs)
+
     def preprocess_loaded_state_dict(
         self, iterator: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterator[tuple[str, torch.Tensor]]:
