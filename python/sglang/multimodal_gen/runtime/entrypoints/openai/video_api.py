@@ -208,7 +208,9 @@ def _build_video_sampling_params(request_id: str, request: VideoGenerationsReque
     server_args = get_global_server_args()
     seconds = request.seconds if request.seconds is not None else DEFAULT_VIDEO_SECONDS
     fps = request.fps if request.fps is not None else DEFAULT_FPS
-    num_frames = request.num_frames if request.num_frames is not None else fps * seconds
+    num_frames = (
+        request.num_frames if request.num_frames is not None else fps * seconds
+    )
     num_outputs = request.num_outputs_per_prompt
     if num_outputs is None:
         num_outputs = request.n or 1
@@ -380,6 +382,20 @@ async def create_video(
     max_sequence_length: Optional[int] = Form(None),
     flow_shift: Optional[float] = Form(None),
     enable_teacache: Optional[bool] = Form(None),
+    generate_sound: Optional[bool] = Form(None),
+    sound_duration: Optional[float] = Form(None),
+    condition_frame_indexes: Optional[str] = Form(None),
+    condition_frame_indexes_vision: Optional[str] = Form(None),
+    condition_video_keep: Optional[str] = Form(None),
+    action_mode: Optional[str] = Form(None),
+    domain_id: Optional[int] = Form(None),
+    domain_name: Optional[str] = Form(None),
+    raw_action_dim: Optional[int] = Form(None),
+    action_fps: Optional[float] = Form(None),
+    action: Optional[str] = Form(None),
+    action_view_point: Optional[str] = Form(None),
+    action_stats_path: Optional[str] = Form(None),
+    action_normalization: Optional[str] = Form(None),
     enable_frame_interpolation: Optional[bool] = Form(None),
     frame_interpolation_exp: Optional[int] = Form(None),
     frame_interpolation_scale: Optional[float] = Form(None),
@@ -539,6 +555,28 @@ async def create_video(
             max_sequence_length=form_value("max_sequence_length", max_sequence_length),
             flow_shift=form_value("flow_shift", flow_shift),
             enable_teacache=form_value("enable_teacache", enable_teacache),
+            generate_sound=form_value("generate_sound", generate_sound),
+            sound_duration=form_value("sound_duration", sound_duration),
+            condition_frame_indexes=form_value(
+                "condition_frame_indexes", condition_frame_indexes
+            ),
+            condition_frame_indexes_vision=form_value(
+                "condition_frame_indexes_vision", condition_frame_indexes_vision
+            ),
+            condition_video_keep=form_value(
+                "condition_video_keep", condition_video_keep
+            ),
+            action_mode=form_value("action_mode", action_mode),
+            domain_id=form_value("domain_id", domain_id),
+            domain_name=form_value("domain_name", domain_name),
+            raw_action_dim=form_value("raw_action_dim", raw_action_dim),
+            action_fps=form_value("action_fps", action_fps),
+            action=form_value("action", action),
+            action_view_point=form_value("action_view_point", action_view_point),
+            action_stats_path=form_value("action_stats_path", action_stats_path),
+            action_normalization=form_value(
+                "action_normalization", action_normalization
+            ),
             enable_frame_interpolation=form_value(
                 "enable_frame_interpolation", enable_frame_interpolation
             ),
