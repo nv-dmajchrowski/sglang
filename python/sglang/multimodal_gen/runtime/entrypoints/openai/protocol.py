@@ -125,6 +125,11 @@ class VideoGenerationsRequest(BaseModel):
     condition_frame_indexes: Optional[List[int]] = None
     condition_frame_indexes_vision: Optional[List[int]] = None
     condition_video_keep: Optional[str] = None
+    # Transfer (control-video) conditioning.
+    control_path: Optional[Union[str, List[str]]] = None
+    control_hint: Optional[Union[str, List[str]]] = None
+    control_guidance: Optional[float] = None
+    control_guidance_interval: Optional[List[float]] = None
     action_mode: Optional[str] = None
     domain_id: Optional[int] = None
     domain_name: Optional[str] = None
