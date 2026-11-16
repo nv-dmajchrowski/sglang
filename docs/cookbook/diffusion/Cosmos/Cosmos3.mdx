@@ -159,7 +159,9 @@ For realtime Bimanual sessions, add
 Each tick consumes one action block and preserves causal KV history.
 
 Transfer-Auto and Sim-Auto take a `multiview` object with `views`, each containing
-`camera_key`, `control_path`, optional `vision_path`, and optional `prompt`. Joint checkpoints
+`camera_key`, `control_path`, optional `vision_path`, and optional `prompt`. The per-view clips
+are one control type, named by a top-level `wsm: {}` (the default), `edge: {}`, `blur: {}`,
+`depth: {}`, or `seg: {}`. Joint checkpoints
 also accept `lidar`; set `lidar.decode=true` to return decoded range maps and previews.
 Outputs pack all frames of each camera consecutively, in request camera order.
 
@@ -356,6 +358,22 @@ job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
 
 Poll and download this job with the same status and content endpoints used by the T2V example.
 
+### Transfer (control video)
+
+Non-distilled, non-Edge checkpoints generate a video that follows one or more control clips: `edge`, `blur`, `depth`, `seg`, or `wsm` (World Scenario Map). Name each control with its hint object in `extra_params`; an `edge` or `blur` hint without `control_path` is computed from the source video given in `video_path`. The output follows the first control clip's length (capped by `max_frames`, and by `num_frames` when the request or the WSM default sets it) and the source video's frame rate. A single typed control picks tuned defaults the request does not override: `guidance_scale=3.0`, `control_guidance=1.5` (`2.0` for `seg`) and `flow_shift=10.0`; `wsm` uses `guidance_scale=1.0`, `control_guidance=3.0`, 101 frames at 10 FPS.
+
+```bash Command
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  --form-string "prompt=A car drives along a coastal highway at dusk." \
+  --form-string "size=832x480" \
+  --form-string "num_frames=93" \
+  --form-string "fps=30" \
+  --form-string 'extra_params={"wsm": {"control_path": "/data/wsm_front.mp4"}}' \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+```
+
+Several hints (for example `{"wsm": {...}, "edge": {"weight": 0.5}}`) attend to the target in separate passes weighted by their normalized `weight`. Transfer captions carry the Transfer system prompt and, unless `emphasize_control_in_prompt` is `false`, a sentence asking the model to follow the named controls; a `control_path` without `control_hint` gets no such sentence. `control_guidance` above `1.0` adds a forward without the controls and amplifies their effect.
+
 ### Action generation
 
 For DROID policy generation, start a server with either the Nano or Edge policy checkpoint. One GPU is enough; to split a request across GPUs, use Ulysses sequence parallelism (`--num-gpus 2 --ulysses-degree 2`). Cosmos3 action generation does not support CFG parallel; policy requests run with `guidance_scale=1.0`, so this only matters if you raise the guidance scale on a multi-GPU server.
@@ -465,6 +483,10 @@ Cosmos3 omnimodal fields are accepted as extra JSON fields or multipart form fie
 - `action_fps`: action-token frame rate for temporal mRoPE; defaults to the video FPS.
 - `action_view_point`: viewpoint used in the structured action caption.
 - `action_normalization`: dataset normalization mode, such as `quantile`, `meanstd`, or `minmax`.
+- `edge`, `blur`, `depth`, `seg`, `wsm`: transfer hint objects with optional `control_path`, `weight`, and `preset_edge_threshold` (edge) or `preset_blur_strength` (blur). `control_path` with `control_hint` (and optional `control_weight`) lists is the equivalent list form.
+- `control_guidance` / `control_guidance_interval`: control-CFG scale (default `1.0`, off) and optional `[low, high]` timestep window.
+- `num_video_frames_per_chunk`, `num_conditional_frames`, `num_first_chunk_conditional_frames`, `max_frames`: long-video transfer chunking (defaults `93`, `1`, `0`, `5000`).
+- `emphasize_control_in_prompt`: append the control-emphasis sentence to transfer prompts (default `true` when every control is typed).
 
 Pass model-specific controls through `extra_body` with the OpenAI Python SDK.
 Raw JSON may keep them at the top level; multipart video requests should put
