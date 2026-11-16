@@ -63,16 +63,22 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding i
     streamed_video_output_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
+    ACTION_INPUT_FIT_MODES,
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
     ACTION_MODE_POLICY,
     ACTION_MODES,
     EMBODIMENT_TO_DOMAIN_ID,
-    build_action_prompt,
-    denormalize_action,
-    get_raw_action_dim,
-    load_action_stats,
-    normalize_action,
+    UNIFIED_ACTION_DIM,
+    UNIFIED_ACTION_SCHEMA,
+    ActionInputFit,
+    action_layout,
+    denormalize_action_rows,
+    fit_action_video,
+    load_action_normalizer,
+    render_action_prompt,
+    resolve_raw_action_dim,
+    unified_action_valid_mask,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -494,6 +500,17 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             )
 
         target_h, target_w = batch.height, batch.width
+        # Bucket fitting (action_resolution) replaces the resize + centre crop of
+        # every action mode's observation image or video.
+        action_resolution = getattr(batch.sampling_params, "action_resolution", None)
+        fit_action_input = (
+            action_resolution is not None
+            and getattr(batch.sampling_params, "action_mode", None)
+            in ACTION_INPUT_FIT_MODES
+        )
+        if fit_action_input and image_path is not None:
+            self._prepare_fitted_action_images(batch, image_path, action_resolution)
+            return batch
 
         if image_path is not None:
             image_sources = (
@@ -548,6 +565,11 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             # to noise.
             num_source_frames = max(cond_indexes) * 4 + 1
             num_target_frames = batch.num_frames
+            if fit_action_input:
+                self._prepare_fitted_action_video(
+                    batch, video_path, keep, num_target_frames, action_resolution
+                )
+                return batch
             force_cpu = (
                 not current_platform.is_cuda()
                 or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
@@ -582,6 +604,65 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             )
 
         return batch
+
+    def _prepare_fitted_action_images(
+        self, batch: Req, image_path: Any, resolution: str
+    ) -> None:
+        """Bucket-fit the action observation image(s) like the reference action
+        inference; a batch must share one bucket and content size."""
+        sources = (
+            list(image_path) if isinstance(image_path, (list, tuple)) else [image_path]
+        )
+        if not sources:
+            raise ValueError("Cosmos3 action image list is empty")
+        pixels, fits = [], []
+        for src in sources:
+            rgb = np.array(load_image(src).convert("RGB"))  # writable copy
+            frames = torch.from_numpy(rgb).permute(2, 0, 1).unsqueeze(1)
+            fitted, fit = fit_action_video(frames, resolution=resolution, num_frames=1)
+            pixels.append(fitted[:, 0])
+            fits.append(fit)
+        if len({(fit.bucket_hw, fit.latent_hw) for fit in fits}) != 1:
+            raise ValueError(
+                "Batched action images must fit the same resolution bucket and "
+                f"content size, got {[(f.bucket_hw, f.content_hw) for f in fits]}"
+            )
+        batch.preprocessed_image = torch.stack(pixels).to(get_local_torch_device())
+        self._apply_action_input_fit(batch, fits[0], resolution)
+
+    def _apply_action_input_fit(
+        self, batch: Req, fit: ActionInputFit, resolution: str
+    ) -> None:
+        batch.height, batch.width = fit.generation_hw
+        # [H, W] the caption reports (the padded bucket) and the latent crop.
+        batch.extra["action_caption_hw"] = fit.bucket_hw
+        batch.extra["action_latent_crop_hw"] = fit.latent_hw
+        self.log_info(
+            f"Fitted action input to bucket {fit.bucket_hw} (content "
+            f"{fit.content_hw}, generation {fit.generation_hw}, tier {resolution})"
+        )
+
+    def _prepare_fitted_action_video(
+        self,
+        batch: Req,
+        video_path: str,
+        keep: str,
+        num_frames: int,
+        resolution: str,
+    ) -> None:
+        """Bucket-fit the action conditioning video like the reference action
+        inference: the padded clip is encoded, its latent cropped to the
+        content region, and the content region becomes the generation size."""
+        with closing(_iter_video_frames_pyav(video_path, num_frames, keep)) as frames:
+            decoded = [torch.from_numpy(np.ascontiguousarray(f)) for f in frames]
+        if not decoded:
+            raise ValueError(f"No frames decoded from video: {video_path!r}")
+        clip = torch.stack(decoded, dim=0).permute(3, 0, 1, 2).contiguous()
+        pixels, fit = fit_action_video(
+            clip, resolution=resolution, num_frames=num_frames
+        )
+        batch.preprocessed_video = pixels.unsqueeze(0)
+        self._apply_action_input_fit(batch, fit, resolution)
 
     @staticmethod
     def _resolve_condition_indexes(batch: Req) -> list[int]:
@@ -730,16 +811,26 @@ class Cosmos3TokenizationStage(PipelineStage):
             COSMOS3_IMAGE_SYSTEM_PROMPT if is_image_gen else COSMOS3_VIDEO_SYSTEM_PROMPT
         )
 
-        # Action mode uses a structured JSON caption with neither a system
-        # prompt nor the duration suffix.
+        # Action mode uses a structured JSON (or plain) caption with neither a
+        # system prompt nor the duration suffix.
         if getattr(batch.sampling_params, "action_mode", None) is not None:
-            prompt = build_action_prompt(
+            sp = batch.sampling_params
+            caption_h, caption_w = batch.extra.get(
+                "action_caption_hw", (batch.height, batch.width)
+            )
+            prompt = render_action_prompt(
                 prompt,
-                getattr(batch.sampling_params, "action_view_point", "ego_view"),
-                num_frames,
-                fps,
-                batch.height,
-                batch.width,
+                format_prompt_as_json=sp.format_prompt_as_json,
+                append_semantics=sp.action_caption_semantics,
+                mode_prompt=(
+                    sp.action_mode if sp.enable_mode_specific_prompt else None
+                ),
+                domain_name=sp.domain_name,
+                view_point=sp.action_view_point,
+                num_frames=num_frames,
+                fps=fps,
+                height=caption_h,
+                width=caption_w,
             )
             use_system_prompt = False
             use_duration_template = False
@@ -956,6 +1047,10 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             with self.use_declared_component(component_name="vae", module=self.vae):
                 with torch.no_grad():
                     cond_latent = self._vae_encode(pixel_input).to(dtype)
+            crop_hw = batch.extra.get("action_latent_crop_hw")
+            if crop_hw is not None:
+                # Bucket-fitted action input: keep the top-left content region.
+                cond_latent = cond_latent[..., : crop_hw[0], : crop_hw[1]]
 
             # Only the encoded latents are needed by the remaining stages.
             batch.preprocessed_video = None
@@ -1064,7 +1159,9 @@ class Cosmos3LatentPreparationStage(PipelineStage):
 
         Action tokens run at frame rate (no temporal compression), so the chunk
         length is ``num_frames - 1`` with ``start_frame_offset=1`` so each action
-        aligns with the frame it drives.
+        aligns with the frame it drives. Image2Action requests
+        (``predict_initial_state``) instead carry ``num_frames`` rows, row 0 being
+        the predicted frame-0 pose, with ``start_frame_offset=0``.
 
         Three modes:
         - ``forward_dynamics``: the user supplies the action; all tokens are
@@ -1082,8 +1179,8 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         action_dim = self.transformer.action_dim
         num_frames = batch.num_frames
 
-        action_chunk_size = num_frames - 1 if num_frames > 1 else 1
-        action_offset = 1 if action_chunk_size == num_frames - 1 else 0
+        layout = action_layout(mode, num_frames, sp.predict_initial_state)
+        action_chunk_size = layout.num_rows
 
         domain_id = self._resolve_domain_id(batch)
         batch_dim = (
@@ -1091,11 +1188,22 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             if getattr(batch, "raw_latent_shape", None)
             else 1
         )
-        raw_action_dim = getattr(sp, "raw_action_dim", None)
-        if raw_action_dim is None:
-            embodiment = getattr(sp, "domain_name", None)
-            if embodiment:
-                raw_action_dim = get_raw_action_dim(embodiment)
+        valid_mask = None
+        if sp.action_schema == UNIFIED_ACTION_SCHEMA:
+            # unified_v1 checkpoints act on the 59D layout; the domain fills
+            # only its slots, so noise and velocity are masked per channel.
+            raw_action_dim = UNIFIED_ACTION_DIM
+            if action_dim < UNIFIED_ACTION_DIM:
+                raise ValueError(
+                    f"unified_v1 needs action_dim >= {UNIFIED_ACTION_DIM}, the "
+                    f"checkpoint has {action_dim}."
+                )
+            valid_mask = torch.zeros(action_dim, dtype=torch.bool, device=device)
+            valid_mask[:UNIFIED_ACTION_DIM] = unified_action_valid_mask(sp.domain_name)
+        else:
+            raw_action_dim = resolve_raw_action_dim(
+                getattr(sp, "domain_name", None), getattr(sp, "raw_action_dim", None)
+            )
 
         if mode == ACTION_MODE_FORWARD_DYNAMICS:
             raw = getattr(sp, "action", None)
@@ -1123,7 +1231,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
             stats_path = getattr(sp, "action_stats_path", None)
             if stats_path is not None:
                 method = getattr(sp, "action_normalization", "quantile")
-                action = normalize_action(action, method, load_action_stats(stats_path))
+                action = load_action_normalizer(method, stats_path).normalize(action)
             if action.shape[-1] < action_dim:
                 pad = torch.zeros(action.shape[0], action_dim - action.shape[-1])
                 action = torch.cat([action, pad], dim=-1)
@@ -1146,8 +1254,7 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         condition_mask = torch.zeros(
             batch_dim, action_chunk_size, 1, device=device, dtype=dtype
         )
-        if mode == ACTION_MODE_FORWARD_DYNAMICS:
-            condition_mask[:] = 1.0
+        condition_mask[:, list(layout.condition_rows)] = 1.0
 
         noise = torch.randn(
             batch_dim,
@@ -1159,6 +1266,9 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         )
         noise[:, :, raw_action_dim:] = 0.0
         clean_action[:, :, raw_action_dim:] = 0.0
+        if valid_mask is not None:
+            noise = noise * valid_mask.to(dtype)
+            clean_action = clean_action * valid_mask.to(dtype)
         action_latents = condition_mask * clean_action + (1.0 - condition_mask) * noise
 
         batch.action_latents = action_latents
@@ -1168,11 +1278,14 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         batch.extra["action_velocity_mask"] = 1.0 - condition_mask
         batch.extra["action_condition_latents"] = clean_action
         batch.extra["raw_action_dim"] = raw_action_dim
-        batch.extra["action_start_frame_offset"] = action_offset
+        batch.extra["action_start_frame_offset"] = layout.start_frame_offset
+        batch.extra["action_has_initial_state"] = sp.predict_initial_state
+        batch.extra["action_valid_mask"] = valid_mask
         self.log_info(
             f"Prepared action latents with shape {tuple(action_latents.shape)} "
             f"(mode={mode}, domain_id={domain_id}, raw_action_dim={raw_action_dim}, "
-            f"start_frame_offset={action_offset})"
+            f"start_frame_offset={layout.start_frame_offset}, "
+            f"predict_initial_state={sp.predict_initial_state})"
         )
 
 
@@ -1657,6 +1770,7 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_velocity_mask = batch.extra.get("action_velocity_mask")
         action_condition_latents = batch.extra.get("action_condition_latents")
         action_raw_dim = batch.extra.get("raw_action_dim")
+        action_valid_mask = batch.extra.get("action_valid_mask")
         action_start_frame_offset = batch.extra.get("action_start_frame_offset", 1)
         action_fps = getattr(batch.sampling_params, "action_fps", None)
         timesteps = batch.timesteps
@@ -2004,6 +2118,10 @@ class Cosmos3DenoisingStage(PipelineStage):
                     and action_raw_dim < action_noise_pred.shape[-1]
                 ):
                     action_noise_pred[..., action_raw_dim:] = 0.0
+                if action_valid_mask is not None:
+                    action_noise_pred = action_noise_pred * action_valid_mask.to(
+                        action_noise_pred.dtype
+                    )
                 action_latents = action_scheduler.step(
                     action_noise_pred,
                     t,
@@ -2652,13 +2770,25 @@ class Cosmos3DecodingStage(PipelineStage):
             action_pred = batch.action_latents.float().cpu()
             if raw_action_dim is not None:
                 action_pred = action_pred[:, :, :raw_action_dim]
+            valid_mask = batch.extra.get("action_valid_mask")
             stats_path = getattr(batch.sampling_params, "action_stats_path", None)
             if stats_path is not None:
-                method = getattr(
-                    batch.sampling_params, "action_normalization", "quantile"
+                action_pred = denormalize_action_rows(
+                    action_pred,
+                    method=batch.sampling_params.action_normalization,
+                    stats_path=stats_path,
+                    initial_state_stats_path=(
+                        batch.sampling_params.action_initial_state_stats_path
+                    ),
+                    has_initial_state=batch.extra.get(
+                        "action_has_initial_state", False
+                    ),
                 )
-                action_pred = denormalize_action(
-                    action_pred, method, load_action_stats(stats_path)
+            if valid_mask is not None:
+                # Slots the domain does not fill decode to zero.
+                keep = valid_mask[: action_pred.shape[-1]].cpu()
+                action_pred = torch.where(
+                    keep, action_pred, torch.zeros_like(action_pred)
                 )
             self.log_info(f"Action predictions shape: {tuple(action_pred.shape)}")
 

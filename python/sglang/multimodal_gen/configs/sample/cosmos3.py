@@ -15,6 +15,17 @@ from typing import Any, ClassVar
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
+    ACTION_INPUT_FIT_MODES,
+    ACTION_MODE_FORWARD_DYNAMICS,
+    ACTION_SCHEMAS,
+    ASPECT_RATIO_SIZE_INFO,
+    INITIAL_STATE_ACTION_MODES,
+    UNIFIED_ACTION_DIM,
+    UNIFIED_ACTION_SCHEMA,
+    UNIFIED_V1_DOMAIN_SLOTS,
+    select_action_stats_path,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -188,6 +199,27 @@ class Cosmos3SamplingParams(SamplingParams):
     # into physical units with ``action_normalization``.
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
+    # Image2Action: the action stream carries num_frames rows and row 0 is the
+    # predicted frame-0 pose a0 (start_frame_offset 0). inverse_dynamics only.
+    predict_initial_state: bool = False
+    # Server-side stats (JSON) that de-normalize the a0 row; never a request field.
+    action_initial_state_stats_path: str | None = None
+    # Action caption: structured JSON (default) or the prompt as a plain caption.
+    format_prompt_as_json: bool = True
+    # With a plain caption, append the domain's semantic postfixes and the
+    # resolution sentence the Lance action recipes train with.
+    action_caption_semantics: bool = False
+    # With a plain caption, add the mode description ("Predict the underlying
+    # action given the video." replaces the inverse-dynamics caption).
+    enable_mode_specific_prompt: bool = False
+    # Server-side action layout of the checkpoint ("native" or "unified_v1");
+    # copied from the pipeline config, never a request field.
+    action_schema: str = "native"
+    # Resolution tier (e.g. "480") that bucket-fits the action conditioning
+    # image or video like the reference: no-upscale resize, bottom/right
+    # reflection padding, latent cropped to the content region. Overrides
+    # height/width with the content size.
+    action_resolution: str | None = None
 
     def is_explicit(self, name: str) -> bool:
         return self._explicit_fields is not None and name in self._explicit_fields
@@ -217,9 +249,11 @@ class Cosmos3SamplingParams(SamplingParams):
         return cls.image_request_extra_fields() | frozenset(
             {
                 "action",
+                "action_caption_semantics",
                 "action_fps",
                 "action_mode",
                 "action_normalization",
+                "action_resolution",
                 "action_view_point",
                 "condition_frame_indexes",
                 "condition_frame_indexes_vision",
@@ -230,12 +264,15 @@ class Cosmos3SamplingParams(SamplingParams):
                 "control_path",
                 "domain_id",
                 "domain_name",
+                "enable_mode_specific_prompt",
+                "format_prompt_as_json",
                 "generate_sound",
                 "guardrails",
                 "max_frames",
                 "num_conditional_frames",
                 "num_first_chunk_conditional_frames",
                 "num_video_frames_per_chunk",
+                "predict_initial_state",
                 "raw_action_dim",
                 "share_vision_temporal_positions",
                 "show_control_condition",
@@ -369,6 +406,10 @@ class Cosmos3SamplingParams(SamplingParams):
             "show_control_condition",
             "show_input",
             "share_vision_temporal_positions",
+            "predict_initial_state",
+            "format_prompt_as_json",
+            "action_caption_semantics",
+            "enable_mode_specific_prompt",
         ):
             value = _parse_request_value(kwargs.get(name))
             if value is None or (isinstance(value, str) and not value.strip()):
@@ -394,6 +435,7 @@ class Cosmos3SamplingParams(SamplingParams):
             "action",
             "action_view_point",
             "action_normalization",
+            "action_resolution",
         ):
             value = _parse_request_value(kwargs.get(name))
             if isinstance(value, str) and not value.strip():
@@ -428,6 +470,10 @@ class Cosmos3SamplingParams(SamplingParams):
         pipeline_config = server_args.pipeline_config
         if self.action_stats_path is None:
             self.action_stats_path = getattr(pipeline_config, "action_stats_path", None)
+        if self.action_initial_state_stats_path is None:
+            self.action_initial_state_stats_path = getattr(
+                pipeline_config, "action_initial_state_stats_path", None
+            )
         distilled_sigmas = pipeline_config.distilled_sigmas
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)
@@ -455,6 +501,12 @@ class Cosmos3SamplingParams(SamplingParams):
                     "Cosmos3 policy and inverse-dynamics requests return one "
                     "prediction per input; num_outputs_per_prompt must be 1"
                 )
+            self.action_schema = getattr(pipeline_config, "action_schema", "native")
+            self._resolve_action_layout_fields()
+        elif self.predict_initial_state or self.action_resolution is not None:
+            raise ValueError(
+                "predict_initial_state and action_resolution require an action_mode."
+            )
 
         # Apply transfer per-hint defaults before the base resolves remaining
         # fields (e.g. flow_shift per mode), so an unset flow_shift can pick up
@@ -532,6 +584,75 @@ class Cosmos3SamplingParams(SamplingParams):
                 *requested_size,
                 self.width,
                 self.height,
+            )
+
+    def _resolve_action_layout_fields(self) -> None:
+        """Validate the Image2Action / caption / input-fitting fields and pick
+        this domain's server-side stats files."""
+        if (
+            self.predict_initial_state
+            and self.action_mode not in INITIAL_STATE_ACTION_MODES
+        ):
+            raise ValueError(
+                "predict_initial_state is only supported with action_mode in "
+                f"{sorted(INITIAL_STATE_ACTION_MODES)}, got {self.action_mode!r}."
+            )
+        if self.action_resolution is not None:
+            if self.action_mode not in ACTION_INPUT_FIT_MODES:
+                raise ValueError(
+                    f"action_resolution does not apply to action_mode={self.action_mode!r}."
+                )
+            self.action_resolution = str(self.action_resolution)
+            if self.action_resolution not in ASPECT_RATIO_SIZE_INFO:
+                raise ValueError(
+                    f"Unknown action_resolution {self.action_resolution!r}; "
+                    f"expected one of {list(ASPECT_RATIO_SIZE_INFO)}."
+                )
+        if (
+            self.action_caption_semantics or self.enable_mode_specific_prompt
+        ) and self.format_prompt_as_json:
+            raise ValueError(
+                "action_caption_semantics and enable_mode_specific_prompt apply to "
+                "plain captions; set format_prompt_as_json=False."
+            )
+        if self.action_schema not in ACTION_SCHEMAS:
+            raise ValueError(
+                f"Unknown action_schema {self.action_schema!r}; expected one of "
+                f"{list(ACTION_SCHEMAS)}."
+            )
+        if self.action_schema == UNIFIED_ACTION_SCHEMA:
+            if self.action_mode == ACTION_MODE_FORWARD_DYNAMICS:
+                raise ValueError(
+                    "unified_v1 forward dynamics needs encoded 59D input actions, "
+                    "which this server does not build; use a predicting mode."
+                )
+            domain = (self.domain_name or "").strip().lower()
+            if domain not in UNIFIED_V1_DOMAIN_SLOTS:
+                raise ValueError(
+                    f"unified_v1 actions need a domain_name with known slots: "
+                    f"{sorted(UNIFIED_V1_DOMAIN_SLOTS)}."
+                )
+            if self.raw_action_dim is not None and int(self.raw_action_dim) != (
+                UNIFIED_ACTION_DIM
+            ):
+                raise ValueError(
+                    f"raw_action_dim ({self.raw_action_dim}) does not match the "
+                    f"unified_v1 width ({UNIFIED_ACTION_DIM})."
+                )
+        self.action_stats_path = select_action_stats_path(
+            self.action_stats_path, self.domain_name
+        )
+        self.action_initial_state_stats_path = select_action_stats_path(
+            self.action_initial_state_stats_path, self.domain_name
+        )
+        if (
+            self.predict_initial_state
+            and self.action_stats_path is not None
+            and self.action_initial_state_stats_path is None
+        ):
+            raise ValueError(
+                "predict_initial_state with action stats needs the server's "
+                "action_initial_state_stats_path to de-normalize the a0 row."
             )
 
     def _validate(self) -> None:

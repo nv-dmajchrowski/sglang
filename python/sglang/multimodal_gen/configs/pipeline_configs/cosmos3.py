@@ -138,8 +138,16 @@ class Cosmos3Config(PipelineConfig):
 
     # Filesystem path to dataset-derived action stats (JSON) for action
     # (de)normalization. Set at server launch rather than per request, since it
-    # names a server-side file. ``None`` disables normalization.
-    action_stats_path: str | None = None
+    # names a server-side file. ``None`` disables normalization. A
+    # ``{domain_name: path}`` mapping serves several domains from one server.
+    action_stats_path: str | dict[str, str] | None = None
+    # Stats (JSON, or a per-domain mapping) for the frame-0 a0 row of
+    # Image2Action (predict_initial_state) outputs.
+    action_initial_state_stats_path: str | dict[str, str] | None = None
+    # Action layout the checkpoint was trained on: "native" (per-domain widths)
+    # or "unified_v1" (59D slots, e.g. the Cosmos3.5 v2 Lance mixture). Exports
+    # do not record it reliably, so it is set at server launch.
+    action_schema: str = "native"
 
     # Pre-computed once in update_config_from_dict from the resolved model_path.
     # None until that point (e.g. in unit-test mocks that never call update_config_from_dict).
