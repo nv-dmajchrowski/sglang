@@ -15,6 +15,7 @@ image anchors ride the I2V velocity mask.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
@@ -29,6 +30,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
     Cosmos3MultiviewDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.sample.cosmos3_multiview import (
+    COSMOS3_MULTIVIEW_COMPLETION_REQUIRES_CONTROL,
     COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH,
     MultiviewViewInput,
     closest_multiview_aspect_ratio,
@@ -69,7 +71,12 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.lidar_outputs import (
     lidar_output_payload,
+    lidar_range_preview_video,
     write_lidar_outputs,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.transfer import (
+    CONTROL_EMPHASIS_TEMPLATE,
+    TRANSFER_SYSTEM_PROMPT,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
@@ -105,6 +112,11 @@ EXTRA_CAMERAS = "multiview_cameras"
 EXTRA_VIEW_PROMPTS = "multiview_view_prompts"
 EXTRA_LIDAR_FRAMES = "multiview_lidar_frames"
 EXTRA_LIDAR_CONDITION_FRAMES = "multiview_lidar_condition_frames"
+# "joint" (cameras + LiDAR), "transfer" (LiDAR-only, HD-map control) or
+# "generation" (LiDAR-only, no control); None without a LiDAR stream.
+EXTRA_LIDAR_MODE = "multiview_lidar_mode"
+# Sweeps of a LiDAR generation request, which has no control clip to count.
+EXTRA_LIDAR_SWEEPS = "multiview_lidar_sweeps"
 EXTRA_LIDAR_LATENTS = "multiview_lidar_latents"
 EXTRA_PACKED_SHAPES = "multiview_packed_shapes"
 EXTRA_CAPTION_LENGTHS = "multiview_caption_lengths_by_cache_key"
@@ -426,27 +438,60 @@ def apply_metadata_templates(
     force_duration_template: bool = False,
     truncate_duration: bool = False,
 ) -> str:
-    """Append duration and resolution sentences to a prose caption."""
+    """Append duration and resolution sentences to a prose caption.
+
+    i4 ``prompts._format_prompt_with_template`` verbatim: each sentence follows
+    the stripped prompt with its trailing periods replaced by ``". "``.
+    """
     prompt = prompt.strip()
-    if duration_template is None and resolution_template is None:
-        return prompt
-    parts: list[str] = []
-    head = prompt.rstrip(".").strip()
-    if head:
-        parts.append(head)
     if duration_template is not None and (num_frames > 1 or force_duration_template):
         duration: float = num_frames / fps
         if truncate_duration:
             # The training augmentor (DurationFPSTextTimeStamps) writes whole
             # seconds unless fractional_duration is set, which the multiview
             # datasets do not; 17 frames at 30 fps reads "0.0 seconds".
-            duration = float(int(duration))
-        parts.append(duration_template.format(duration=duration, fps=fps).rstrip("."))
+            duration = int(duration)
+        sentence = duration_template.format(duration=duration, fps=fps)
+        prompt = prompt.rstrip(".") + ". " + sentence
+    prompt = prompt.strip()
     if resolution_template is not None:
-        parts.append(resolution_template.format(height=height, width=width).rstrip("."))
-    if not parts:
-        return ""
-    return ". ".join(parts) + "."
+        sentence = resolution_template.format(height=height, width=width)
+        prompt = prompt.rstrip(".") + ". " + sentence
+    return prompt
+
+
+def format_json_caption(
+    prompt: str,
+    *,
+    num_frames: int,
+    fps: float,
+    height: int,
+    width: int,
+    aspect_ratio: str | None,
+) -> str | None:
+    """Inject training-time metadata into a JSON-object caption; None if not JSON.
+
+    i4 ``prompts._format_json_prompt_with_template``: duration/fps, then
+    resolution and aspect ratio, overwriting what the caption carried.
+    """
+    try:
+        caption = json.loads(prompt)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(caption, dict):
+        return None
+    metadata: dict[str, Any] = {}
+    if num_frames > 1:
+        duration_seconds = int(num_frames / fps) if fps > 0 else 0
+        metadata.update({"duration": f"{duration_seconds}s", "fps": float(fps)})
+    else:
+        caption.pop("duration", None)
+        caption.pop("fps", None)
+    metadata["resolution"] = {"H": int(height), "W": int(width)}
+    if aspect_ratio is not None:
+        metadata["aspect_ratio"] = aspect_ratio
+    caption.update(metadata)
+    return json.dumps(caption)
 
 
 def _camera_identity(camera: str) -> str:
@@ -495,22 +540,32 @@ def format_separate_view_captions(
     ]
 
 
-def format_per_view_negative_prompt(
-    negative: str,
+def format_view_prompt(
+    caption: str,
     *,
     num_frames: int,
     fps: float,
     height: int,
     width: int,
+    aspect_ratio: str | None = None,
 ) -> str:
-    """The shared negative caption of a per-camera-caption request, as the model reads it.
+    """One camera's caption with its metadata, as i4 ``multiview_captions._format_view_prompt``.
 
-    Mirrors the reference ``_format_sample_prompt(per_view_negative_prompt, ...,
-    truncate_duration=True)``: the duration and resolution sentences every
-    positive caption carries, but neither the rig header nor the emphasis.
+    A JSON-object caption gets the structured fields; prose gets the duration
+    (whole seconds) and resolution sentences.
     """
+    structured = format_json_caption(
+        caption,
+        num_frames=num_frames,
+        fps=fps,
+        height=height,
+        width=width,
+        aspect_ratio=aspect_ratio,
+    )
+    if structured is not None:
+        return structured
     return apply_metadata_templates(
-        negative,
+        caption,
         num_frames=num_frames,
         fps=fps,
         height=height,
@@ -519,6 +574,40 @@ def format_per_view_negative_prompt(
         resolution_template=RESOLUTION_TEMPLATE,
         truncate_duration=True,
     )
+
+
+def format_per_view_negative_prompt(
+    negative: str,
+    *,
+    num_frames: int,
+    fps: float,
+    height: int,
+    width: int,
+    aspect_ratio: str | None = None,
+) -> str:
+    """The shared negative caption of a per-camera-caption request, as the model reads it.
+
+    Mirrors the reference ``_format_sample_prompt(per_view_negative_prompt, ...,
+    truncate_duration=True)``: the duration and resolution sentences every
+    positive caption carries, but neither the rig header nor the emphasis.
+    """
+    return format_view_prompt(
+        negative,
+        num_frames=num_frames,
+        fps=fps,
+        height=height,
+        width=width,
+        aspect_ratio=aspect_ratio,
+    )
+
+
+def uses_mads_rig_header(cameras: list[str] | tuple[str, ...]) -> bool:
+    """i4 ``caption_chunks``: the rig/camera header only when every key is a MADS camera.
+
+    Opaque camera ids (generic view slots, PAIBench ``dev1``) keep their
+    captions verbatim.
+    """
+    return all(camera in COSMOS3_MADS_CAMERA_ATTRIBUTES for camera in cameras)
 
 
 def format_per_view_prompts(
@@ -530,19 +619,28 @@ def format_per_view_prompts(
     height: int,
     width: int,
     emphasis: str | None,
+    aspect_ratio: str | None = None,
 ) -> list[str]:
     """Per-camera prompts as the model reads them: rig header, metadata, emphasis."""
+    if len(captions) != len(cameras):
+        raise ValueError(
+            "Cosmos3 multiview per-camera captions must match the selected cameras: "
+            f"captions={len(captions)}, cameras={len(cameras)}."
+        )
+    headered = (
+        format_separate_view_captions(captions, cameras)
+        if uses_mads_rig_header(cameras)
+        else list(captions)
+    )
     prompts = []
-    for caption in format_separate_view_captions(captions, cameras):
-        prompt = apply_metadata_templates(
+    for caption in headered:
+        prompt = format_view_prompt(
             caption,
             num_frames=num_frames,
             fps=fps,
             height=height,
             width=width,
-            duration_template=DURATION_TEMPLATE,
-            resolution_template=RESOLUTION_TEMPLATE,
-            truncate_duration=True,
+            aspect_ratio=aspect_ratio,
         )
         if emphasis:
             prompt = f"{prompt.rstrip()} {emphasis}"
@@ -553,8 +651,15 @@ def format_per_view_prompts(
 # ---------------------------------------------------------------------------
 # Stages
 # ---------------------------------------------------------------------------
+# Camera keys of a warmup request on an export that names no rig (i4 contract).
+COSMOS3_MULTIVIEW_WARMUP_CAMERAS = ("view_00",)
+
+
 class Cosmos3MultiviewInputStage(PipelineStage):
     """Load every camera's WSM control clip, optional RGB vision input, and LiDAR control.
+
+    Hint-less requests (no ``control_path`` on any view, i4's G1 route) carry no
+    control pixels; their RGB targets are the whole generation stream.
 
     Writes camera-major ``uint8 [1, 3, V*F, H, W]`` pixel tensors to
     ``batch.extra`` together with the per-camera frame count and the local
@@ -581,18 +686,25 @@ class Cosmos3MultiviewInputStage(PipelineStage):
             if batch.is_warmup:
                 return None
             raise ValueError(
-                "Cosmos3 multiview requests need multiview.views with one WSM "
-                "control clip per camera (or a control_path list in checkpoint "
-                "camera order for text-to-video)."
+                "Cosmos3 multiview requests need multiview.views with one caption "
+                "per camera (and a WSM control clip per camera for transfer), or a "
+                "control_path list in checkpoint camera order for text-to-video."
             )
         camera_keys = [view.camera_key for view in views]
         if any(key is not None for key in camera_keys):
-            unknown = [key for key in camera_keys if key not in cameras]
+            unknown = [key for key in camera_keys if cameras and key not in cameras]
             if unknown:
                 raise ValueError(
                     "Cosmos3 multiview cameras must be exported checkpoint cameras: "
                     f"unknown={unknown}, exported={list(cameras)}."
                 )
+            # Physical rig rows exist only for trained cameras.
+            deployment.rig_view_ids(camera_keys)
+        elif not cameras:
+            raise ValueError(
+                "This checkpoint names no camera rig; set multiview.views[*].camera_key "
+                "on every view."
+            )
         else:
             if len(views) != len(cameras):
                 raise ValueError(
@@ -613,8 +725,10 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 "This checkpoint tokenizes one caption per camera; supply a non-empty "
                 "multiview.views[*].prompt for every camera."
             )
-        control_kinds = {media_kind(view.control) for view in views}
-        if len(control_kinds) != 1:
+        control_kinds = {
+            media_kind(view.control) for view in views if view.control is not None
+        }
+        if len(control_kinds) > 1:
             raise ValueError(
                 "Cosmos3 multiview control inputs must be all images or all videos, "
                 f"got {sorted(control_kinds)}."
@@ -636,8 +750,15 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         sampling_params = batch.sampling_params
         if views is None or sampling_params.resolved_aspect_ratio() != "auto":
             return
+        # The first WSM control, else (hint-less) the first RGB input; a
+        # text-to-video request without either keeps the 16:9 placeholder.
+        source = views[0].control or next(
+            (view.vision for view in views if view.vision is not None), None
+        )
+        if source is None:
+            return
         resolution = str(sampling_params.resolution)
-        source_h, source_w = media_hw(views[0].control)
+        source_h, source_w = media_hw(source)
         ratio = closest_multiview_aspect_ratio(source_h, source_w, resolution)
         width, height = multiview_canvas(resolution, ratio)
         if (int(batch.width), int(batch.height)) != (width, height):
@@ -696,26 +817,26 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         return torch.cat(clips, dim=1).unsqueeze(0).contiguous()
 
     def _load_lidar(
-        self, batch: Req, num_frames: int, fps: float
+        self, batch: Req, sweeps: int
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
-        """The HD-map control clip and, when requested, the measured prefix sweeps."""
+        """The HD-map control clip (None for LiDAR generation) and, when requested,
+        the measured prefix sweeps."""
         lidar = batch.sampling_params.resolved_lidar()
         if lidar is None:
             return None, None
-        deployment = self.deployment
-        if not deployment.supports_lidar:
+        if not self.deployment.supports_lidar:
             raise ValueError(
-                "Joint camera/LiDAR requests require a checkpoint with the LiDAR encoder."
+                "LiDAR requests require a checkpoint with the LiDAR encoder."
             )
-        lidar_fps = float(deployment.lidar["fps"])
-        sweeps = required_lidar_sweeps(num_frames, fps, lidar_fps)
-        frames = load_lidar_control_frames(lidar["control_path"])
-        if frames.shape[1] < sweeps:
-            self.log_warning(
-                f"LiDAR control has {frames.shape[1]} sweeps; padding to the {sweeps} the "
-                f"{num_frames}-frame clip at {fps:g} FPS covers at {lidar_fps:g} Hz."
-            )
-        frames = pad_lidar_sweeps(frames, sweeps)
+        frames = None
+        if lidar["control_path"] is not None:
+            frames = load_lidar_control_frames(lidar["control_path"])
+            if frames.shape[1] < sweeps:
+                self.log_warning(
+                    f"LiDAR control has {frames.shape[1]} sweeps; padding to the "
+                    f"{sweeps} sweeps of the request."
+                )
+            frames = pad_lidar_sweeps(frames, sweeps)
         condition = None
         if lidar.get("condition_path"):
             count = int(lidar["num_conditional_sweeps"])
@@ -730,7 +851,9 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                     f"Cosmos3 lidar.condition_path holds {measured.shape[1]} sweeps; "
                     f"{count} conditional sweeps were requested."
                 )
-            if tuple(measured.shape[2:]) != tuple(frames.shape[2:]):
+            if frames is not None and tuple(measured.shape[2:]) != tuple(
+                frames.shape[2:]
+            ):
                 raise ValueError(
                     "Cosmos3 measured LiDAR sweeps must share the control's range-map grid: "
                     f"measured={tuple(measured.shape[2:])}, control={tuple(frames.shape[2:])}."
@@ -738,8 +861,43 @@ class Cosmos3MultiviewInputStage(PipelineStage):
             condition = measured[:, :count].contiguous()
         return frames, condition
 
+    def _prepare_lidar_only(self, batch: Req) -> Req:
+        """LiDAR transfer (HD-map control) or generation (none): one caption, no cameras.
+
+        imaginaire4 legacy ``build_lidar_transfer_batch``: ``lidar = [hdmap,
+        target]`` with no vision items; training's ``LidarGenerationToTrainingFormat``
+        packs ``lidar = [target]`` with a 0- or 1-sweep clean prefix.
+        """
+        sweeps = int(batch.num_frames)
+        frames, condition = self._load_lidar(batch, sweeps)
+        mode = "transfer" if frames is not None else "generation"
+        prompt = batch.prompt if isinstance(batch.prompt, str) else ""
+        batch.extra.update(
+            {
+                EXTRA_CONTROL_PIXELS: None,
+                EXTRA_VISION_PIXELS: None,
+                EXTRA_VIEW_PROMPTS: [prompt],
+                EXTRA_NUM_VIEWS: 0,
+                EXTRA_FRAMES_PER_VIEW: 1,
+                EXTRA_LOCAL_CONDITION_INDEXES: [],
+                EXTRA_KNOWN_VIEWS: [],
+                EXTRA_CAMERAS: (),
+                EXTRA_LIDAR_FRAMES: frames,
+                EXTRA_LIDAR_CONDITION_FRAMES: condition,
+                EXTRA_LIDAR_MODE: mode,
+                EXTRA_LIDAR_SWEEPS: sweeps,
+            }
+        )
+        self.log_info(
+            f"Prepared LiDAR-only {mode}: {sweeps} sweeps at {float(batch.fps):g} Hz"
+            f"{', measured prefix %d' % condition.shape[1] if condition is not None else ''}"
+        )
+        return batch
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         sampling_params = batch.sampling_params
+        if sampling_params.is_lidar_only():
+            return self._prepare_lidar_only(batch)
         cameras = self.deployment.cameras
         views = self._resolve_views(batch)
         self._resolve_canvas(batch, views)
@@ -755,15 +913,15 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         if views is None:
             num_frames = COSMOS3_MULTIVIEW_WARMUP_NUM_FRAMES
             batch.num_frames = num_frames
-            selected = list(cameras)
+            selected = list(cameras or COSMOS3_MULTIVIEW_WARMUP_CAMERAS)
             batch.extra[EXTRA_CONTROL_PIXELS] = synthetic_multiview_pixels(
-                num_views=len(cameras),
+                num_views=len(selected),
                 num_frames=num_frames,
                 height=height,
                 width=width,
             )
             batch.extra[EXTRA_VISION_PIXELS] = None
-            batch.extra[EXTRA_VIEW_PROMPTS] = [""] * len(cameras)
+            batch.extra[EXTRA_VIEW_PROMPTS] = [""] * len(selected)
             local_indexes: list[int] = []
         else:
             num_frames = int(batch.num_frames)
@@ -785,11 +943,28 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 index for index, view in enumerate(views) if view.vision is not None
             ]
             has_vision = bool(known_views)
+            has_control = views[0].control is not None
             completion = has_vision and len(known_views) < len(views)
+            if completion and not has_control:
+                raise ValueError(COSMOS3_MULTIVIEW_COMPLETION_REQUIRES_CONTROL)
             condition_video_as_image = (
                 sampling_params.resolved_condition_video_as_image()
             )
-            lidar_frames, lidar_condition = self._load_lidar(batch, num_frames, fps)
+            lidar_frames, lidar_condition = None, None
+            if sampling_params.lidar is not None:
+                lidar_frames, lidar_condition = self._load_lidar(
+                    batch,
+                    required_lidar_sweeps(
+                        num_frames, fps, float(self.deployment.lidar["fps"])
+                    )
+                    if self.deployment.supports_lidar
+                    else 1,
+                )
+            if lidar_frames is not None and not has_control:
+                raise ValueError(
+                    "Joint camera/LiDAR generation is a transfer: every view needs a "
+                    "WSM control_path."
+                )
             if lidar_frames is not None and completion:
                 raise ValueError(
                     "Joint camera/LiDAR RGB conditions must cover every camera or none."
@@ -801,13 +976,17 @@ class Cosmos3MultiviewInputStage(PipelineStage):
                 raise ValueError(
                     "View completion requires complete RGB videos for the known cameras."
                 )
-            batch.extra[EXTRA_CONTROL_PIXELS] = self._pack_camera_major(
-                views,
-                field="control",
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                keep_first=False,
+            batch.extra[EXTRA_CONTROL_PIXELS] = (
+                self._pack_camera_major(
+                    views,
+                    field="control",
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    keep_first=False,
+                )
+                if has_control
+                else None
             )
             batch.extra[EXTRA_VISION_PIXELS] = (
                 self._pack_camera_major(
@@ -857,9 +1036,14 @@ class Cosmos3MultiviewInputStage(PipelineStage):
         batch.extra[EXTRA_CAMERAS] = tuple(selected)
         batch.extra[EXTRA_LIDAR_FRAMES] = lidar_frames
         batch.extra[EXTRA_LIDAR_CONDITION_FRAMES] = lidar_condition
+        batch.extra[EXTRA_LIDAR_MODE] = "joint" if lidar_frames is not None else None
         mode = "text2video" if not (local_indexes or known_views) else "image2video"
+        if len(local_indexes) > 1:
+            mode = "video2video"
         if known_views:
             mode = "view_completion"
+        if batch.extra[EXTRA_CONTROL_PIXELS] is None:
+            mode += ", hint-less"
         self.log_info(
             f"Prepared {len(selected)} camera views x {num_frames} frames at {width}x{height} "
             f"({mode}, condition latent frames per camera {local_indexes}"
@@ -892,9 +1076,17 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
         return max_sequence_length + 2
 
     def _tokenize_compact(
-        self, texts: list[str], cap: int, device: torch.device, system_prompt: str
+        self,
+        texts: list[str],
+        cap: int,
+        device: torch.device,
+        system_prompt: str | None,
     ) -> tuple[torch.Tensor, tuple[int, ...]]:
-        """Tokenize each text separately and concatenate the real tokens."""
+        """Tokenize each text separately and concatenate the real tokens.
+
+        ``system_prompt=None`` packs the user turn alone (i4 ``tokenize_caption``
+        with no system prompt), as hint-less requests do.
+        """
         pieces = []
         lengths = []
         for text in texts:
@@ -902,12 +1094,44 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
                 text=text,
                 max_sequence_length=cap,
                 device=device,
-                use_system_prompt=True,
+                use_system_prompt=system_prompt is not None,
                 system_prompt=system_prompt,
             )
             pieces.append(ids[:, :seq_len])
             lengths.append(int(seq_len))
         return torch.cat(pieces, dim=1), tuple(lengths)
+
+    def _lidar_only_texts(self, batch: Req) -> tuple[str, str, str | None]:
+        """(caption, negative caption, system prompt) of a LiDAR-only request.
+
+        Transfer follows imaginaire4 legacy ``transfer.py``: the transfer system
+        prompt, the duration/resolution sentences of the range-map clip and the
+        optional single-view control emphasis. Generation has no inference
+        reference; it packs the caption as training's LiDAR-generation stream
+        does (no system prompt, no metadata), with an empty negative caption.
+        """
+        sampling_params = batch.sampling_params
+        caption = batch.extra[EXTRA_VIEW_PROMPTS][0]
+        if batch.extra[EXTRA_LIDAR_MODE] == "generation":
+            return caption, "", None
+        frames = batch.extra[EXTRA_LIDAR_FRAMES]
+        metadata = dict(
+            num_frames=int(frames.shape[1]),
+            fps=float(batch.fps),
+            height=int(frames.shape[2]),
+            width=int(frames.shape[3]),
+            duration_template=DURATION_TEMPLATE,
+            resolution_template=RESOLUTION_TEMPLATE,
+        )
+        caption = apply_metadata_templates(caption, **metadata)
+        if sampling_params.emphasize_control_in_prompt:
+            caption = caption.rstrip() + CONTROL_EMPHASIS_TEMPLATE.format(hint="lidar")
+        negative = batch.negative_prompt or ""
+        if str(sampling_params.negative_metadata_mode) == "same":
+            negative = (
+                apply_metadata_templates(negative, **metadata).lstrip(".").strip()
+            )
+        return caption, negative, TRANSFER_SYSTEM_PROMPT
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
@@ -915,15 +1139,28 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
         num_frames = int(batch.num_frames)
         height, width = int(batch.height), int(batch.width)
         cap = self._tokenizer_cap(batch)
-        joint = batch.extra.get(EXTRA_LIDAR_FRAMES) is not None
+        if batch.extra.get(EXTRA_LIDAR_MODE) in ("transfer", "generation"):
+            caption, negative, system_prompt = self._lidar_only_texts(batch)
+            return self._store_tokens(
+                batch,
+                cond=self._tokenize_compact([caption], cap, device, system_prompt),
+                uncond=self._tokenize_compact([negative], cap, device, system_prompt),
+                fps=fps,
+                preview=caption,
+            )
+        joint = batch.extra.get(EXTRA_LIDAR_MODE) == "joint"
         emphasize = batch.sampling_params.resolved_emphasize_control(
             bool(self.deployment.inference_default("emphasize_control_in_prompt", True))
         )
 
         cameras = list(batch.extra[EXTRA_CAMERAS])
         captions = list(batch.extra[EXTRA_VIEW_PROMPTS])
+        # i4 multiview_entries: the AV system prompt and the control emphasis
+        # belong to transfer requests; a hint-less request packs neither.
+        transfer = batch.extra.get(EXTRA_CONTROL_PIXELS) is not None
+        aspect_ratio = batch.sampling_params.resolved_aspect_ratio()
         emphasis = None
-        if emphasize:
+        if emphasize and transfer:
             emphasis = COSMOS3_JOINT_EMPHASIS if joint else COSMOS3_MULTIVIEW_EMPHASIS
         prompts = format_per_view_prompts(
             captions,
@@ -933,12 +1170,15 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
             height=height,
             width=width,
             emphasis=emphasis,
+            aspect_ratio=None if aspect_ratio == "auto" else aspect_ratio,
         )
-        system_prompt = (
-            COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM
-            if joint
-            else COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM
-        )
+        system_prompt = None
+        if transfer:
+            system_prompt = (
+                COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM
+                if joint
+                else COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM
+            )
         cond_ids, cond_lengths = self._tokenize_compact(
             prompts, cap, device, system_prompt
         )
@@ -953,6 +1193,7 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
                 fps=fps,
                 height=height,
                 width=width,
+                aspect_ratio=None if aspect_ratio == "auto" else aspect_ratio,
             )
             uncond_captions = [negative_caption] * len(prompts)
             if not batch.is_warmup:
@@ -968,10 +1209,25 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
                     "as training's caption dropout produced; set per_view_negative_prompt "
                     "to opt into a shared negative caption."
                 )
-        uncond_ids, uncond_lengths = self._tokenize_compact(
-            uncond_captions, cap, device, system_prompt
+        return self._store_tokens(
+            batch,
+            cond=(cond_ids, cond_lengths),
+            uncond=self._tokenize_compact(uncond_captions, cap, device, system_prompt),
+            fps=fps,
+            preview=prompts[0],
         )
-        preview = prompts[0]
+
+    def _store_tokens(
+        self,
+        batch: Req,
+        *,
+        cond: tuple[torch.Tensor, tuple[int, ...]],
+        uncond: tuple[torch.Tensor, tuple[int, ...]],
+        fps: float,
+        preview: str,
+    ) -> Req:
+        cond_ids, cond_lengths = cond
+        uncond_ids, uncond_lengths = uncond
 
         batch.extra["cond_text_ids"] = cond_ids
         batch.extra["cond_text_mask"] = torch.ones_like(cond_ids)
@@ -991,6 +1247,124 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
                 f"negative {uncond_ids.shape[1]}): {preview[:240]!r}"
             )
         return batch
+
+
+def multiview_condition_indexes(
+    *,
+    known_views: list[int],
+    local_indexes: list[int],
+    num_views: int,
+    latent_frames_per_view: int,
+) -> list[int]:
+    """Clean camera-major latent frames: every frame of the known views (view
+    completion), else the per-view-local indexes expanded to every view."""
+    if known_views:
+        return [
+            int(view) * latent_frames_per_view + frame
+            for view in known_views
+            for frame in range(latent_frames_per_view)
+        ]
+    local_indexes = [int(i) for i in local_indexes]
+    if any(index < 0 or index >= latent_frames_per_view for index in local_indexes):
+        raise ValueError(
+            "Cosmos3 multiview condition frame index is outside the generated latent clip."
+        )
+    return expand_multiview_condition_frame_indexes(
+        local_indexes, num_views, num_views * latent_frames_per_view
+    )
+
+
+def multiview_mask_items(
+    *,
+    num_views: int,
+    camera_token_shape: tuple[int, int, int],
+    camera_seconds_per_frame: float,
+    has_camera_control: bool,
+    lidar_token_shape: tuple[int, int, int] | None = None,
+    lidar_seconds_per_frame: float | None = None,
+    has_lidar_control: bool = False,
+) -> list[MaskItem]:
+    """The request's packed GEN items in i4's order: camera control, camera
+    target, LiDAR control, LiDAR target (``_multiview_sensor_mask_items``).
+
+    LiDAR sits on the view past the cameras (view 0 in a LiDAR-only pack).
+    """
+    items: list[MaskItem] = []
+    if num_views:
+        if has_camera_control:
+            items.append(
+                MaskItem(
+                    camera_token_shape,
+                    num_views,
+                    is_control=True,
+                    seconds_per_frame=camera_seconds_per_frame,
+                )
+            )
+        items.append(
+            MaskItem(
+                camera_token_shape,
+                num_views,
+                seconds_per_frame=camera_seconds_per_frame,
+            )
+        )
+    if lidar_token_shape is not None:
+        if lidar_seconds_per_frame is None:
+            raise ValueError("Cosmos3 LiDAR items need their seconds per sweep.")
+        for is_control in (True, False) if has_lidar_control else (False,):
+            items.append(
+                MaskItem(
+                    lidar_token_shape,
+                    1,
+                    view_offset=num_views,
+                    is_control=is_control,
+                    seconds_per_frame=lidar_seconds_per_frame,
+                    is_lidar=True,
+                )
+            )
+    if not items:
+        raise ValueError("Cosmos3 multiview requests need a camera or LiDAR stream.")
+    return items
+
+
+def multiview_layout_for(
+    deployment: Cosmos3MultiviewDeploymentConfig,
+    *,
+    items: list[MaskItem],
+    num_views: int,
+    latent_frames: int,
+    patch_hw: tuple[int, int],
+    seconds_per_frame: float,
+    backend: str,
+) -> MultiviewLayout:
+    """The request's attention layout under the checkpoint's attention contract.
+
+    Oct-7 exports: decomposed scope with the past-only window. i4-contract
+    (Ultra) exports: the declared scope, ``(start, end)`` window and first-frame
+    anchor. Both let controls read their own view's targets (i4 always does) and
+    LiDAR read every caption unless the export says otherwise.
+    """
+    bounds = deployment.window_bounds
+    past_only = deployment.temporal_window_bounds is None
+    return MultiviewLayout(
+        num_views=num_views,
+        latent_frames=latent_frames,
+        patch_height=patch_hw[0],
+        patch_width=patch_hw[1],
+        attention_scope=deployment.attention_scope,
+        decomposed_temporal_window_seconds=(
+            deployment.cross_view_past_window_seconds if past_only else None
+        ),
+        temporal_window_bounds=None if past_only else bounds,
+        includes_first_frame=deployment.attends_first_frame,
+        control_attends_sensor=True,
+        seconds_per_frame=seconds_per_frame,
+        backend=backend,
+        # The kernels pad the text stream to one fixed capacity per caption
+        # so prompts of every length share one compiled kernel.
+        max_und_tokens=DEFAULT_MAX_UND_TOKENS * max(num_views, 1),
+        items=tuple(items),
+        lidar_attends_captions=deployment.lidar_attends_captions,
+    )
 
 
 class Cosmos3MultiviewLatentStage(PipelineStage):
@@ -1050,7 +1424,9 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         result = VerificationResult()
         result.add_check(
-            EXTRA_CONTROL_PIXELS, batch.extra.get(EXTRA_CONTROL_PIXELS), V.is_tensor
+            EXTRA_CONTROL_PIXELS,
+            batch.extra.get(EXTRA_CONTROL_PIXELS),
+            lambda value: value is None or V.is_tensor(value),
         )
         result.add_check("height", batch.height, V.positive_int_divisible(16))
         result.add_check("width", batch.width, V.positive_int_divisible(16))
@@ -1094,26 +1470,153 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             )
         return torch.cat(latents, dim=2)
 
-    def _condition_indexes(
-        self, batch: Req, *, num_views: int, latent_frames_per_view: int, latent_t: int
-    ) -> list[int]:
-        known_views = [int(v) for v in (batch.extra.get(EXTRA_KNOWN_VIEWS) or [])]
-        if known_views:
-            return [
-                view * latent_frames_per_view + frame
-                for view in known_views
-                for frame in range(latent_frames_per_view)
-            ]
-        local_indexes = [
-            int(i) for i in (batch.extra.get(EXTRA_LOCAL_CONDITION_INDEXES) or [])
-        ]
-        if any(index < 0 or index >= latent_frames_per_view for index in local_indexes):
-            raise ValueError(
-                "Cosmos3 multiview condition frame index is outside the generated latent clip."
-            )
-        return expand_multiview_condition_frame_indexes(
-            local_indexes, num_views, latent_t
+    def _encode_camera_stream(
+        self,
+        batch: Req,
+        *,
+        noise: torch.Tensor,
+        num_views: int,
+        frames_per_view: int,
+        latent_frames_per_view: int,
+        device: torch.device,
+        dtype: torch.dtype,
+        model_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
+        """Camera targets with their anchors: (latents, velocity mask, clean latents, control, #anchored)."""
+        shape = tuple(noise.shape)
+        latent_t = int(shape[2])
+        condition_indexes = multiview_condition_indexes(
+            known_views=batch.extra.get(EXTRA_KNOWN_VIEWS) or [],
+            local_indexes=batch.extra.get(EXTRA_LOCAL_CONDITION_INDEXES) or [],
+            num_views=num_views,
+            latent_frames_per_view=latent_frames_per_view,
         )
+        vision_pixels = batch.extra.get(EXTRA_VISION_PIXELS)
+        control_pixels = batch.extra.get(EXTRA_CONTROL_PIXELS)
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            # Hint-less requests (i4 G1) pack the RGB targets alone.
+            control_latents = (
+                self._encode_camera_major(
+                    control_pixels,
+                    num_views=num_views,
+                    frames_per_view=frames_per_view,
+                    device=device,
+                    dtype=model_dtype,
+                )
+                if control_pixels is not None
+                else None
+            )
+            encoded_vision = None
+            if vision_pixels is not None and condition_indexes:
+                encoded_vision = self._encode_camera_major(
+                    vision_pixels,
+                    num_views=num_views,
+                    frames_per_view=frames_per_view,
+                    device=device,
+                    dtype=dtype,
+                )
+        if control_latents is not None and tuple(control_latents.shape) != shape:
+            raise ValueError(
+                "Cosmos3 multiview WSM and target latent shapes must match: "
+                f"control={tuple(control_latents.shape)}, target={shape}."
+            )
+        condition_mask = torch.zeros(1, 1, latent_t, 1, 1, device=device, dtype=dtype)
+        condition_latents = torch.zeros_like(noise)
+        if condition_indexes:
+            if encoded_vision is None:
+                raise ValueError(
+                    "Cosmos3 multiview condition indexes require per-camera vision inputs."
+                )
+            if tuple(encoded_vision.shape) != shape:
+                raise ValueError(
+                    "Cosmos3 multiview target VAE latent shape mismatch: "
+                    f"expected={shape}, got={tuple(encoded_vision.shape)}."
+                )
+            for index in condition_indexes:
+                condition_mask[:, :, index] = 1.0
+                condition_latents[:, :, index] = encoded_vision[:, :, index]
+        latents = condition_mask * condition_latents + (1.0 - condition_mask) * noise
+        velocity_mask = (1.0 - condition_mask).expand_as(noise)
+        return (
+            latents,
+            velocity_mask,
+            condition_latents,
+            control_latents,
+            len(condition_indexes),
+        )
+
+    def _lidar_latent_shape(self, sweeps: int) -> tuple[int, ...]:
+        """``[1, C, T, h, w]`` of a ``sweeps``-long clip, from the exported tokenizer geometry."""
+        lidar = self.deployment.lidar
+        rows, columns = (int(v) for v in lidar["network_config"]["resolution"])
+        down_h, down_w = (int(v) for v in lidar["spatial_compression"])
+        # The V1.2 contract fixes temporal compression to 1: one latent per sweep.
+        return (
+            1,
+            int(lidar["latent_channels"]),
+            sweeps,
+            rows // down_h,
+            columns // down_w,
+        )
+
+    def _encode_lidar_stream(
+        self,
+        batch: Req,
+        *,
+        generator: torch.Generator | None,
+        device: torch.device,
+        dtype: torch.dtype,
+        model_dtype: torch.dtype,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None, int]:
+        """LiDAR target with its measured prefix: (latents, velocity mask, clean latents, control, #prefix)."""
+        if self.lidar_encoder is None or self.deployment.lidar is None:
+            raise ValueError("LiDAR requests require the LiDAR encoder to be loaded.")
+        lidar_frames = batch.extra.get(EXTRA_LIDAR_FRAMES)
+        control_latents = None
+        if lidar_frames is not None:
+            self.begin_declared_component_use(
+                component_name="lidar_encoder", module=self.lidar_encoder
+            )
+            control_latents = self.lidar_encoder(lidar_frames).to(
+                device=device, dtype=model_dtype
+            )
+            shape = tuple(control_latents.shape)
+        else:
+            # LiDAR generation: no HD-map control, the target geometry alone.
+            shape = self._lidar_latent_shape(int(batch.extra[EXTRA_LIDAR_SWEEPS]))
+        # Continue the request RNG after the camera noise so a seed
+        # reproduces both streams.
+        noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+        latents = noise
+        velocity_mask = torch.ones_like(noise)
+        condition = torch.zeros_like(noise)
+        count = 0
+        condition_frames = batch.extra.get(EXTRA_LIDAR_CONDITION_FRAMES)
+        if condition_frames is not None:
+            # Measured sweeps start the LiDAR target clean, the way the
+            # cameras' first frame anchors the RGB targets: no noise, zero
+            # velocity, restored after every solver step.
+            self.begin_declared_component_use(
+                component_name="lidar_encoder", module=self.lidar_encoder
+            )
+            prefix = self._encode_lidar_prefix(
+                condition_frames,
+                total_sweeps=int(noise.shape[2]),
+                device=device,
+                dtype=dtype,
+            )
+            count = int(prefix.shape[2])
+            expected = (noise.shape[1], count, *noise.shape[3:])
+            if tuple(prefix.shape[1:]) != expected:
+                raise ValueError(
+                    "Cosmos3 LiDAR condition latents must have shape "
+                    f"{expected}, got {tuple(prefix.shape[1:])}."
+                )
+            latents = noise.clone()
+            latents[:, :, :count] = prefix
+            velocity_mask[:, :, :count] = 0.0
+            condition[:, :, :count] = prefix
+        return latents, velocity_mask, condition, control_latents, count
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
@@ -1132,191 +1635,122 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
         latent_t = num_views * latent_frames_per_view
         latent_h = int(batch.height) // spatial_factor
         latent_w = int(batch.width) // spatial_factor
-        shape = (1, int(self.transformer.latent_channel), latent_t, latent_h, latent_w)
+        patch_h, patch_w, _, _ = self.transformer._pad_to_patch_size(latent_h, latent_w)
+        fps = float(batch.extra.get("fps") or batch.fps)
+        camera_rate = temporal_factor / fps
 
         generator = batch.generator
         if generator is None and batch.seed is not None:
             generator = torch.Generator(device=device).manual_seed(int(batch.seed))
             batch.generator = generator
-        noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
 
-        vision_pixels = batch.extra.get(EXTRA_VISION_PIXELS)
-        condition_indexes = self._condition_indexes(
-            batch,
-            num_views=num_views,
-            latent_frames_per_view=latent_frames_per_view,
-            latent_t=latent_t,
-        )
-        with self.use_declared_component(component_name="vae", module=self.vae):
-            control_latents = self._encode_camera_major(
-                batch.extra[EXTRA_CONTROL_PIXELS],
+        targets: list[torch.Tensor] = []
+        masks: list[torch.Tensor] = []
+        conditions: list[torch.Tensor] = []
+        controls: list[torch.Tensor] = []
+        anchored = 0
+        if num_views:
+            shape = (
+                1,
+                int(self.transformer.latent_channel),
+                latent_t,
+                latent_h,
+                latent_w,
+            )
+            noise = torch.randn(shape, generator=generator, device=device, dtype=dtype)
+            latents, mask, condition, control, anchored = self._encode_camera_stream(
+                batch,
+                noise=noise,
                 num_views=num_views,
                 frames_per_view=frames_per_view,
-                device=device,
-                dtype=model_dtype,
-            )
-            encoded_vision = None
-            if vision_pixels is not None and condition_indexes:
-                encoded_vision = self._encode_camera_major(
-                    vision_pixels,
-                    num_views=num_views,
-                    frames_per_view=frames_per_view,
-                    device=device,
-                    dtype=dtype,
-                )
-        if tuple(control_latents.shape) != shape:
-            raise ValueError(
-                "Cosmos3 multiview WSM and target latent shapes must match: "
-                f"control={tuple(control_latents.shape)}, target={shape}."
-            )
-
-        condition_mask = torch.zeros(1, 1, latent_t, 1, 1, device=device, dtype=dtype)
-        condition_latents = torch.zeros_like(noise)
-        if condition_indexes:
-            if encoded_vision is None:
-                raise ValueError(
-                    "Cosmos3 multiview condition indexes require per-camera vision inputs."
-                )
-            if tuple(encoded_vision.shape) != shape:
-                raise ValueError(
-                    "Cosmos3 multiview target VAE latent shape mismatch: "
-                    f"expected={shape}, got={tuple(encoded_vision.shape)}."
-                )
-            for index in condition_indexes:
-                condition_mask[:, :, index] = 1.0
-                condition_latents[:, :, index] = encoded_vision[:, :, index]
-        camera_latents = (
-            condition_mask * condition_latents + (1.0 - condition_mask) * noise
-        )
-        camera_velocity_mask = (1.0 - condition_mask).expand_as(noise)
-
-        patch_h, patch_w, _, _ = self.transformer._pad_to_patch_size(latent_h, latent_w)
-        fps = float(batch.extra.get("fps") or batch.fps)
-        camera_shape = (latent_t, patch_h, patch_w)
-        camera_rate = temporal_factor / fps
-        items = [
-            MaskItem(
-                camera_shape, num_views, is_control=True, seconds_per_frame=camera_rate
-            ),
-            MaskItem(camera_shape, num_views, seconds_per_frame=camera_rate),
-        ]
-        targets = [camera_latents]
-        masks = [camera_velocity_mask]
-        conditions = [condition_latents]
-
-        lidar_frames = batch.extra.get(EXTRA_LIDAR_FRAMES)
-        lidar_control_latents = None
-        lidar_fps = None
-        lidar_tcf = 1
-        if lidar_frames is not None:
-            if self.lidar_encoder is None or deployment.lidar is None:
-                raise ValueError(
-                    "Joint camera/LiDAR requests require the LiDAR encoder to be loaded."
-                )
-            lidar_fps = float(deployment.lidar["fps"])
-            lidar_tcf = int(deployment.lidar["temporal_compression_factor"])
-            self.begin_declared_component_use(
-                component_name="lidar_encoder", module=self.lidar_encoder
-            )
-            lidar_control_latents = self.lidar_encoder(lidar_frames).to(
-                device=device, dtype=model_dtype
-            )
-            # Continue the request RNG after the camera noise so a seed
-            # reproduces both streams.
-            lidar_noise = torch.randn(
-                lidar_control_latents.shape,
-                generator=generator,
+                latent_frames_per_view=latent_frames_per_view,
                 device=device,
                 dtype=dtype,
+                model_dtype=model_dtype,
             )
-            lidar_latents = lidar_noise
-            lidar_mask = torch.ones_like(lidar_noise)
-            lidar_condition = torch.zeros_like(lidar_noise)
-            condition_frames = batch.extra.get(EXTRA_LIDAR_CONDITION_FRAMES)
-            if condition_frames is not None:
-                # Measured sweeps start the LiDAR target clean, the way the
-                # cameras' first frame anchors the RGB targets: no noise, zero
-                # velocity, restored after every solver step.
-                prefix = self._encode_lidar_prefix(
-                    condition_frames,
-                    total_sweeps=int(lidar_noise.shape[2]),
+            targets.append(latents)
+            masks.append(mask)
+            conditions.append(condition)
+            if control is not None:
+                controls.append(control)
+        has_camera_control = bool(controls)
+
+        lidar_shape = None
+        lidar_fps = None
+        lidar_tcf = 1
+        lidar_control_latents = None
+        lidar_prefix = 0
+        if batch.extra.get(EXTRA_LIDAR_MODE) is not None:
+            latents, mask, condition, lidar_control_latents, lidar_prefix = (
+                self._encode_lidar_stream(
+                    batch,
+                    generator=generator,
                     device=device,
                     dtype=dtype,
+                    model_dtype=model_dtype,
                 )
-                count = int(prefix.shape[2])
-                expected = (lidar_noise.shape[1], count, *lidar_noise.shape[3:])
-                if tuple(prefix.shape[1:]) != expected:
-                    raise ValueError(
-                        "Cosmos3 LiDAR condition latents must have shape "
-                        f"{expected}, got {tuple(prefix.shape[1:])}."
-                    )
-                lidar_latents = lidar_noise.clone()
-                lidar_latents[:, :, :count] = prefix
-                lidar_mask[:, :, :count] = 0.0
-                lidar_condition[:, :, :count] = prefix
-            targets.append(lidar_latents)
-            masks.append(lidar_mask)
-            conditions.append(lidar_condition)
-            lt, lh, lw = lidar_noise.shape[2:]
-            lhp, lwp = self.transformer.lidar_patch_grid(lh, lw)
-            lidar_rate = lidar_tcf / lidar_fps
-            for is_control in (True, False):
-                items.append(
-                    MaskItem(
-                        (lt, lhp, lwp),
-                        1,
-                        view_offset=num_views,
-                        is_control=is_control,
-                        seconds_per_frame=lidar_rate,
-                        is_lidar=True,
-                    )
-                )
+            )
+            targets.append(latents)
+            masks.append(mask)
+            conditions.append(condition)
+            lidar_fps = float(deployment.lidar["fps"])
+            lidar_tcf = int(deployment.lidar["temporal_compression_factor"])
+            lt, lh, lw = latents.shape[2:]
+            lidar_shape = (int(lt), *self.transformer.lidar_patch_grid(lh, lw))
 
-        layout = MultiviewLayout(
+        items = multiview_mask_items(
             num_views=num_views,
-            latent_frames=latent_t,
-            patch_height=patch_h,
-            patch_width=patch_w,
-            # The architecture this model has: decomposed scope with a past-only
-            # cross-view window, controls reading their own view's targets, LiDAR
-            # reading every caption.
-            attention_scope="decomposed",
-            decomposed_temporal_window_seconds=deployment.cross_view_past_window_seconds,
-            control_attends_sensor=True,
+            camera_token_shape=(latent_t, patch_h, patch_w),
+            camera_seconds_per_frame=camera_rate,
+            has_camera_control=has_camera_control,
+            lidar_token_shape=lidar_shape,
+            lidar_seconds_per_frame=(
+                lidar_tcf / lidar_fps if lidar_fps is not None else None
+            ),
+            has_lidar_control=lidar_control_latents is not None,
+        )
+        layout = multiview_layout_for(
+            deployment,
+            items=items,
+            num_views=max(num_views, 1),
+            latent_frames=latent_t if num_views else items[0].token_shape[0],
+            patch_hw=(patch_h, patch_w),
             seconds_per_frame=camera_rate,
             backend=self.attention_backend,
-            # The kernels pad the text stream to one fixed capacity per caption
-            # so prompts of every length share one compiled kernel.
-            max_und_tokens=DEFAULT_MAX_UND_TOKENS * num_views,
-            items=tuple(items),
-            lidar_attends_captions=True,
         )
         # Physical rig ids of the request's cameras; subsets and reordered views
-        # keep each camera's trained row.
-        rig_view_ids = torch.tensor(
-            deployment.rig_view_ids(batch.extra[EXTRA_CAMERAS]),
-            dtype=torch.long,
-            device=device,
+        # keep each camera's trained row. None without a rig view embedding.
+        rig_ids = (
+            deployment.rig_view_ids(batch.extra[EXTRA_CAMERAS]) if num_views else None
         )
-        # Temporal positions wrap per view so every camera shares one time axis.
-        temporal_position_period = latent_frames_per_view
+        rig_view_ids = (
+            torch.tensor(rig_ids, dtype=torch.long, device=device)
+            if rig_ids is not None
+            else None
+        )
         packed_shapes = tuple(
             tuple(int(d) for d in tensor.shape[1:]) for tensor in targets
         )
+        # A LiDAR-only transfer carries its HD-map control as the request's
+        # control, so control CFG and its dropped-control branch apply to it.
+        if lidar_control_latents is not None and not num_views:
+            controls.append(lidar_control_latents)
+            lidar_control_latents = None
 
         batch.latents = pack_state(targets)
         batch.raw_latent_shape = tuple(batch.latents.shape)
         batch.extra["video_shape"] = (latent_t, latent_h, latent_w)
         batch.extra["vae_scale_factor_temporal"] = temporal_factor
         batch.extra["vae_scale_factor_spatial"] = spatial_factor
-        batch.extra["control_latents"] = [control_latents]
+        batch.extra["control_latents"] = controls or None
         batch.extra["condition_latents"] = pack_state(conditions)
         batch.extra["velocity_mask"] = pack_state(masks)
         batch.extra[EXTRA_LATENT_FRAMES_PER_VIEW] = latent_frames_per_view
         batch.extra[EXTRA_PACKED_SHAPES] = packed_shapes
         batch.extra[EXTRA_LIDAR_LATENTS] = None
         batch.extra[EXTRA_TRANSFORMER_KWARGS] = {
-            "temporal_position_period": temporal_position_period,
+            # Temporal positions wrap per view so every camera shares one time axis.
+            "temporal_position_period": latent_frames_per_view if num_views else None,
             "multiview_layout": layout,
             "packed_shapes": packed_shapes,
             "caption_lengths_by_cache_key": batch.extra.get(EXTRA_CAPTION_LENGTHS),
@@ -1326,15 +1760,18 @@ class Cosmos3MultiviewLatentStage(PipelineStage):
             "rig_view_ids": rig_view_ids,
         }
         lidar_note = ""
-        if lidar_control_latents is not None:
-            lidar_note = f", LiDAR latents {tuple(lidar_control_latents.shape)}"
-            if batch.extra.get(EXTRA_LIDAR_CONDITION_FRAMES) is not None:
-                lidar_note += f" with {int(batch.extra[EXTRA_LIDAR_CONDITION_FRAMES].shape[1])} measured prefix sweeps"
+        if lidar_shape is not None:
+            lidar_note = (
+                f", LiDAR ({batch.extra[EXTRA_LIDAR_MODE]}) latents "
+                f"{tuple(targets[-1].shape)}"
+            )
+            if lidar_prefix:
+                lidar_note += f" with {lidar_prefix} measured prefix sweeps"
         self.log_info(
-            f"Prepared multiview latents {shape} ({num_views} cameras x "
-            f"{latent_frames_per_view} latent frames, {layout.gen_tokens} GEN tokens, "
-            f"{len(condition_indexes)} anchored frames, attention backend "
-            f"{self.attention_backend}{lidar_note})"
+            f"Prepared multiview latents ({num_views} cameras x "
+            f"{latent_frames_per_view if num_views else 0} latent frames, "
+            f"{layout.gen_tokens} GEN tokens, {anchored} anchored frames, attention "
+            f"backend {self.attention_backend}{lidar_note})"
         )
         return batch
 
@@ -1383,9 +1820,11 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
             )
         return uses
 
-    def _decode_lidar(self, batch: Req, latents: torch.Tensor) -> dict[str, Any] | None:
+    def _decode_lidar(
+        self, batch: Req, latents: torch.Tensor, *, force: bool = False
+    ) -> dict[str, Any] | None:
         lidar_request = batch.sampling_params.resolved_lidar() or {}
-        if not lidar_request.get("decode", False):
+        if not (force or lidar_request.get("decode", False)):
             return None
         if self.lidar_decoder is None:
             raise ValueError(
@@ -1423,10 +1862,27 @@ class Cosmos3MultiviewDecodingStage(Cosmos3DecodingStage):
             f"{payload['valid_fraction']:.1%} rays valid"
             f"{', files ' + ', '.join(sorted(files.values())) if files else ''}"
         )
+        if force:
+            # LiDAR-only: the range preview stands in for the camera video.
+            batch.extra["transfer_decoded_output"] = lidar_range_preview_video(
+                clip, min_range_m=min_range_m, max_range_m=max_range_m
+            )
         return payload
+
+    def _forward_lidar_only(self, batch: Req, server_args: ServerArgs):
+        (lidar_latents,) = unpack_state(batch.latents, batch.extra[EXTRA_PACKED_SHAPES])
+        batch.extra[EXTRA_LIDAR_LATENTS] = lidar_latents
+        batch.latents = lidar_latents
+        batch.raw_latent_shape = tuple(lidar_latents.shape)
+        payload = self._decode_lidar(batch, lidar_latents, force=True)
+        output_batch = super().forward(batch, server_args)
+        output_batch.lidar = payload
+        return output_batch
 
     def forward(self, batch: Req, server_args: ServerArgs):
         num_views = int(batch.extra[EXTRA_NUM_VIEWS])
+        if num_views == 0:
+            return self._forward_lidar_only(batch, server_args)
         latent_frames_per_view = int(batch.extra[EXTRA_LATENT_FRAMES_PER_VIEW])
         packed_shapes = batch.extra[EXTRA_PACKED_SHAPES]
         unpacked = unpack_state(batch.latents, packed_shapes)

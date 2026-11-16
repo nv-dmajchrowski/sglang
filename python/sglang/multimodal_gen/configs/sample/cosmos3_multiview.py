@@ -22,12 +22,20 @@ input JSON::
       "lidar": {"control_path": "hdmap_rangemap.safetensors"}
     }
 
-Every view needs a pre-computed WSM ``control_path``. ``vision_path`` (an RGB
-still or clip) is optional but must be given for every camera or none; with it
-the request is image-to-video, without it text-to-video. Every camera takes its
-caption in ``views[].prompt``. ``lidar`` selects joint camera/LiDAR generation on exports that ship
-the LiDAR encoder. As a CLI convenience, a ``control_path`` list in checkpoint
-camera order selects text-to-video without the ``multiview`` object.
+A WSM ``control_path`` on every view selects transfer; omitting it on every
+view selects i4's hint-less multiview generation (the target cameras alone, no
+control item, no transfer system prompt). ``vision_path`` (an RGB still or clip)
+is optional; on every camera it selects image-to-video (a still, or
+``condition_video_as_image``) or video-to-video (a clip, two clean latent
+frames); on some cameras only it selects view completion, which i4 admits for
+transfer requests only. Every camera takes its caption in ``views[].prompt``.
+``lidar`` selects joint camera/LiDAR generation on exports that ship the LiDAR
+encoder; ``lidar`` without ``multiview`` selects LiDAR-only generation. As a CLI
+convenience, a ``control_path`` list in checkpoint camera order selects
+text-to-video without the ``multiview`` object.
+
+Camera-pose and camera-geometry sidecars are refused, as i4's standalone route
+refuses them (``multiview_requests.MULTIVIEW_CAMERA_POSE_REFUSAL``).
 """
 
 from __future__ import annotations
@@ -58,6 +66,11 @@ COSMOS3_MULTIVIEW_DEFAULT_FPS = 30
 COSMOS3_MULTIVIEW_DEFAULT_GUIDANCE_SCALE = 6.0
 COSMOS3_MULTIVIEW_DEFAULT_NUM_INFERENCE_STEPS = 35
 COSMOS3_MULTIVIEW_DEFAULT_FLOW_SHIFT = 10.0
+# LiDAR-only defaults: imaginaire4 legacy ``_TRANSFER_DEFAULTS[LIDAR]`` (96 sweeps,
+# guidance 3) and the Ultra recipe's ``shift_lidar=5`` for a LiDAR-only batch.
+COSMOS3_LIDAR_ONLY_DEFAULT_SWEEPS = 96
+COSMOS3_LIDAR_ONLY_DEFAULT_GUIDANCE = 3.0
+COSMOS3_LIDAR_ONLY_DEFAULT_SHIFT = 5.0
 # Prompt cap per caption, the reference tokenizer's truncation limit; the two
 # framing tokens the tokenizer appends come on top of it.
 COSMOS3_MULTIVIEW_MAX_SEQUENCE_LENGTH = 4096
@@ -97,13 +110,29 @@ _ALLOWED_MULTIVIEW_FIELDS = frozenset(
 _ALLOWED_VIEW_FIELDS = frozenset(
     {"camera_key", "vision_path", "control_path", "vision", "control", "prompt"}
 )
+# i4's camera-pose / RigRoPE geometry sidecars, which its standalone route refuses.
+_CAMERA_POSE_VIEW_FIELDS = frozenset(
+    {"camera_pose_path", "camera_geometry_path", "camera_pose_stream_id"}
+)
+COSMOS3_MULTIVIEW_CAMERA_POSE_REFUSAL = (
+    "camera-pose conditioning (camera_pose_path, camera_geometry_path, "
+    "camera_pose_stream_id, multiview.camera_pose_frame_indices) is not supported: "
+    "the reference (imaginaire4) standalone route does not generate it"
+)
+COSMOS3_MULTIVIEW_COMPLETION_REQUIRES_CONTROL = (
+    "Multiview view completion requires per-view controls and exactly one transfer "
+    "hint (a WSM control_path on every view)."
+)
 
 
 class MultiviewViewInput(msgspec.Struct, frozen=True):
-    """One camera's request inputs. ``camera_key`` is None when implied by order."""
+    """One camera's request inputs. ``camera_key`` is None when implied by order.
+
+    ``control`` is None on every view of a hint-less (uncontrolled) request.
+    """
 
     camera_key: str | None
-    control: str
+    control: str | None
     vision: str | None
     prompt: str | None = None
 
@@ -209,6 +238,8 @@ def validate_multiview_request(multiview: Any) -> list[dict[str, Any]]:
         raise ValueError(
             f"multiview must be a JSON object, got {type(multiview).__name__}."
         )
+    if "camera_pose_frame_indices" in multiview:
+        raise ValueError(COSMOS3_MULTIVIEW_CAMERA_POSE_REFUSAL)
     unknown = set(multiview) - _ALLOWED_MULTIVIEW_FIELDS
     if unknown:
         raise ValueError(f"Unsupported Cosmos3 multiview fields: {sorted(unknown)}.")
@@ -218,15 +249,20 @@ def validate_multiview_request(multiview: Any) -> list[dict[str, Any]]:
     for index, view in enumerate(views):
         if not isinstance(view, dict):
             raise ValueError(f"multiview.views[{index}] must be an object.")
+        if set(view) & _CAMERA_POSE_VIEW_FIELDS:
+            raise ValueError(COSMOS3_MULTIVIEW_CAMERA_POSE_REFUSAL)
         unknown_view = set(view) - _ALLOWED_VIEW_FIELDS
         if unknown_view:
             raise ValueError(
                 f"Unsupported Cosmos3 multiview view {index} fields: {sorted(unknown_view)}."
             )
         control = _view_value(view, "control")
-        if not isinstance(control, str) or not control.strip():
+        if control is not None and (
+            not isinstance(control, str) or not control.strip()
+        ):
             raise ValueError(
-                f"multiview.views[{index}] requires a pre-computed WSM control_path."
+                f"multiview.views[{index}].control_path must be a pre-computed WSM "
+                "control clip path."
             )
         vision = _view_value(view, "vision")
         if vision is not None and (not isinstance(vision, str) or not vision.strip()):
@@ -236,6 +272,12 @@ def validate_multiview_request(multiview: Any) -> list[dict[str, Any]]:
         prompt = view.get("prompt")
         if prompt is not None and not isinstance(prompt, str):
             raise ValueError(f"multiview.views[{index}].prompt must be a string.")
+    controls_present = [_view_value(view, "control") is not None for view in views]
+    if any(controls_present) and not all(controls_present):
+        raise ValueError(
+            "Cosmos3 multiview WSM control_path must be supplied for every view or "
+            "none (none selects hint-less multiview generation)."
+        )
     camera_keys = [view.get("camera_key") for view in views]
     if any(key is not None for key in camera_keys):
         if not all(isinstance(key, str) and key for key in camera_keys):
@@ -275,11 +317,14 @@ def validate_multiview_request(multiview: Any) -> list[dict[str, Any]]:
 COSMOS3_LIDAR_DEFAULT_CONDITION_SWEEPS = 1
 
 
-def validate_lidar_request(lidar: Any) -> dict[str, Any]:
-    """Validate the joint camera/LiDAR ``lidar`` object.
+def validate_lidar_request(
+    lidar: Any, *, require_control: bool = True
+) -> dict[str, Any]:
+    """Validate the ``lidar`` object of a joint or LiDAR-only request.
 
     ``control_path`` is the prepared HD-map range-map clip every joint request
-    needs. ``decode`` (default false) asks for the LiDAR output as well: the
+    (and every LiDAR-only transfer) needs; a LiDAR-only request without it is
+    LiDAR generation. ``decode`` (default false) asks for the LiDAR output as well: the
     denoised LiDAR latents are decoded to range maps and written next to the
     camera video. ``condition_path`` (optional) holds measured sweeps in the same
     tensor format; the first ``num_conditional_sweeps`` (default 1) of them are
@@ -290,14 +335,19 @@ def validate_lidar_request(lidar: Any) -> dict[str, Any]:
         raise ValueError(f"lidar must be a JSON object, got {type(lidar).__name__}.")
     allowed = {"control_path", "decode", "condition_path", "num_conditional_sweeps"}
     unknown = set(lidar) - allowed
-    if unknown or not isinstance(lidar.get("control_path"), str):
+    has_path = isinstance(lidar.get("control_path"), str)
+    if unknown or not (
+        has_path or (not require_control and "control_path" not in lidar)
+    ):
         raise ValueError(
             "Cosmos3 lidar requires a control_path string and accepts only the "
             f"optional decode, condition_path and num_conditional_sweeps fields; "
             f"got keys {sorted(lidar)}."
         )
-    path = lidar["control_path"].strip()
-    if os.path.splitext(path)[1].lower() not in COSMOS3_LIDAR_CONTROL_SUFFIXES:
+    path = lidar["control_path"].strip() if has_path else None
+    if path is not None and (
+        os.path.splitext(path)[1].lower() not in COSMOS3_LIDAR_CONTROL_SUFFIXES
+    ):
         raise ValueError(
             "Cosmos3 lidar.control_path must be a prepared range-map tensor "
             f"({sorted(COSMOS3_LIDAR_CONTROL_SUFFIXES)}), got {path!r}."
@@ -466,7 +516,11 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
                         if view.get("camera_key") is not None
                         else None
                     ),
-                    control=str(_view_value(view, "control")),
+                    control=(
+                        str(_view_value(view, "control"))
+                        if _view_value(view, "control") is not None
+                        else None
+                    ),
                     vision=(
                         str(_view_value(view, "vision"))
                         if _view_value(view, "vision") is not None
@@ -484,8 +538,20 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
             for path in control_paths
         ]
 
+    def is_lidar_only(self) -> bool:
+        """A ``lidar`` request without cameras: LiDAR transfer or generation."""
+        return (
+            self.lidar is not None
+            and self.multiview is None
+            and not self._resolve_control_paths()
+        )
+
     def resolved_lidar(self) -> dict[str, Any] | None:
-        return validate_lidar_request(self.lidar) if self.lidar is not None else None
+        if self.lidar is None:
+            return None
+        return validate_lidar_request(
+            self.lidar, require_control=not self.is_lidar_only()
+        )
 
     def resolved_condition_video_as_image(self) -> bool:
         nested = None
@@ -545,7 +611,7 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
         if self.multiview is not None:
             validate_multiview_request(self.multiview)
         if self.lidar is not None:
-            validate_lidar_request(self.lidar)
+            self.resolved_lidar()
         if self.wsm is not None and self.wsm is not True:
             if not isinstance(self.wsm, dict) or set(self.wsm) - {"weight"}:
                 raise ValueError(
@@ -600,6 +666,13 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
             self.num_frames = int(nested_num_frames)
         if deployment is None:
             return
+        # i4-contract exports default the clip length too (93 frames at 10 FPS).
+        if nested_num_frames is None and self._is_unset(
+            "num_frames", COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES
+        ):
+            self.num_frames = int(
+                deployment.inference_default("num_frames", self.num_frames)
+            )
         if self._is_unset("fps", COSMOS3_MULTIVIEW_DEFAULT_FPS):
             self.fps = int(round(float(deployment.inference_default("fps", self.fps))))
         if self._is_unset(
@@ -640,6 +713,23 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
         )
         resolution = self.resolved_resolution(str(default_resolution))
         aspect_ratio = self.resolved_aspect_ratio()
+        nested_aspect = (
+            self.multiview.get("aspect_ratio")
+            if isinstance(self.multiview, dict)
+            else None
+        )
+        if (
+            deployment is not None
+            and nested_aspect is None
+            and self.aspect_ratio is None
+            and self.width is None
+            and self.height is None
+        ):
+            # i4 has no aspect detection: an unset aspect ratio is the export's
+            # default bucket (16:9 for the i4 contract); Oct-7 exports detect it.
+            aspect_ratio = normalize_multiview_aspect_ratio(
+                deployment.inference_default("aspect_ratio", None)
+            )
         bucket = (
             COSMOS3_MULTIVIEW_DEFAULT_ASPECT_RATIO
             if aspect_ratio == "auto"
@@ -678,6 +768,9 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
 
     def _adjust(self, server_args) -> None:
         deployment = getattr(server_args.pipeline_config, "multiview_deployment", None)
+        if self.is_lidar_only():
+            self._adjust_lidar_only(server_args, deployment)
+            return
         self._apply_deployment_defaults(deployment)
         if self.lidar is not None and (
             deployment is None or not deployment.supports_lidar
@@ -712,7 +805,69 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
                 "Cosmos3 multiview takes per-camera vision inputs through "
                 "multiview.views[*].vision_path, not image_path/video_path."
             )
+        self._validate_request_mode()
         self._apply_guidance_policy(deployment)
+
+    def _adjust_lidar_only(self, server_args, deployment: Any) -> None:
+        """LiDAR transfer / generation on the LiDAR clock (imaginaire4 legacy
+        ``_TRANSFER_DEFAULTS[LIDAR]``): ``num_frames`` counts sweeps, never
+        rounded to the camera VAE grid, at the tokenizer's sweep rate."""
+        if deployment is None or not deployment.supports_lidar:
+            raise ValueError(
+                "LiDAR requests require a checkpoint that ships the LiDAR encoder and "
+                "projections (transformer config multiview.lidar)."
+            )
+        lidar_fps = float(deployment.lidar["fps"])
+        if self.is_explicit("fps") and not math.isclose(float(self.fps), lidar_fps):
+            raise ValueError(
+                f"LiDAR-only requests run at the tokenizer's {lidar_fps:g} Hz; got fps={self.fps}."
+            )
+        self.fps = int(round(lidar_fps))
+        if self._is_unset("num_frames", COSMOS3_MULTIVIEW_DEFAULT_NUM_FRAMES):
+            self.num_frames = COSMOS3_LIDAR_ONLY_DEFAULT_SWEEPS
+        if self._is_unset("guidance_scale", COSMOS3_MULTIVIEW_DEFAULT_GUIDANCE_SCALE):
+            self.guidance_scale = COSMOS3_LIDAR_ONLY_DEFAULT_GUIDANCE
+        if self._is_unset(
+            "num_inference_steps", COSMOS3_MULTIVIEW_DEFAULT_NUM_INFERENCE_STEPS
+        ):
+            self.num_inference_steps = int(
+                deployment.inference_default("num_steps", self.num_inference_steps)
+            )
+        if self.flow_shift is None:
+            self.flow_shift = COSMOS3_LIDAR_ONLY_DEFAULT_SHIFT
+        if self.normalize_cfg is None:
+            self.normalize_cfg = False
+        if self.emphasize_control_in_prompt is None:
+            self.emphasize_control_in_prompt = False
+        if not self.is_explicit("negative_metadata_mode"):
+            # imaginaire4 transfer defaults: the negative caption carries no metadata.
+            self.negative_metadata_mode = "none"
+        sweeps = int(self.num_frames)
+        if sweeps < 2:
+            raise ValueError(
+                f"LiDAR-only requests generate at least 2 sweeps, got {sweeps}."
+            )
+        if self.image_path is not None or self.video_path is not None:
+            raise ValueError("LiDAR-only requests take no camera inputs.")
+        # The camera canvas is unused; any valid bucket satisfies the base checks.
+        self._resolve_canvas(deployment)
+        SamplingParams._adjust(self, server_args)
+        self.num_frames = sweeps
+        self.share_vision_temporal_positions = True
+
+    def _validate_request_mode(self) -> None:
+        """i4's admission rules that span views: hint vs controls, view completion."""
+        if self.multiview is None:
+            return
+        views = self.resolve_views()
+        has_control = views[0].control is not None
+        if not has_control and self.wsm is not None:
+            raise ValueError(
+                "Cosmos3 multiview wsm requires a control_path on every view."
+            )
+        known = [view.vision is not None for view in views]
+        if any(known) and not all(known) and not has_control:
+            raise ValueError(COSMOS3_MULTIVIEW_COMPLETION_REQUIRES_CONTROL)
 
     def _apply_guidance_policy(self, deployment: Any) -> None:
         del deployment  # The export's defaults were applied; guidance is not clamped.

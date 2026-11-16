@@ -263,9 +263,10 @@ def _pair_predicate(metadata, q_index, kv_index):
         metadata.query_vectors(),
         metadata.key_vectors(),
         metadata.attention_scope,
-        metadata.decomposed_temporal_window_seconds,
+        metadata.temporal_window_bounds,
         metadata.control_attends_sensor,
         metadata.lidar_attends_captions,
+        metadata.includes_first_frame,
     )
     return pair_allowed(q_index, kv_index)
 
@@ -1609,8 +1610,23 @@ class TestSamplingParamsAndInputStage(unittest.TestCase):
                 "num_conditional_sweeps": None,
             },
         )
-        with self.assertRaisesRegex(ValueError, "control_path"):
-            validate_multiview_request({"views": [{"camera_key": "front"}]})
+        # No control on any view is i4's hint-less multiview generation; a
+        # control on some views only is refused.
+        self.assertEqual(
+            len(validate_multiview_request({"views": [{"camera_key": "front"}]})), 1
+        )
+        with self.assertRaisesRegex(ValueError, "control_path must be supplied"):
+            views = _views(("front", "left"))
+            del views[1]["control_path"]
+            validate_multiview_request({"views": views})
+        with self.assertRaisesRegex(ValueError, "camera-pose conditioning"):
+            views = _views(("front",))
+            views[0]["camera_pose_path"] = "pose.json"
+            validate_multiview_request({"views": views})
+        with self.assertRaisesRegex(ValueError, "camera-pose conditioning"):
+            validate_multiview_request(
+                {"views": _views(("front",)), "camera_pose_frame_indices": [0, 1]}
+            )
         with self.assertRaisesRegex(ValueError, "Unsupported Cosmos3 multiview fields"):
             validate_multiview_request({"views": _views(("front",)), "lidar": {}})
         with self.assertRaisesRegex(ValueError, "resolution"):

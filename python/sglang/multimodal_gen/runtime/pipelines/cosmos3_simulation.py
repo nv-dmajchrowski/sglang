@@ -366,13 +366,16 @@ class Cosmos3MultiviewPipeline(ComposedPipelineBase):
                 lidar_decoder=self.get_module("lidar_decoder"),
             )
         )
+        deployment = server_args.pipeline_config.multiview_deployment
         logger.info(
-            "Cosmos3 multiview pipeline stages created (%d cameras, backend=%s, "
-            "cross-view window=%.2f s, lidar=%s)",
-            server_args.pipeline_config.multiview_deployment.num_views,
+            "Cosmos3 multiview pipeline stages created (%s contract, %s cameras, "
+            "backend=%s, cross-view window=%s, rig embedding=%s, lidar=%s)",
+            deployment.schema,
+            deployment.num_views or "any",
             self.attention_backend,
-            server_args.pipeline_config.multiview_deployment.cross_view_past_window_seconds,
-            server_args.pipeline_config.multiview_deployment.supports_lidar,
+            deployment.describe_window(),
+            deployment.rig_view_embedding is not None,
+            deployment.supports_lidar,
         )
 
 

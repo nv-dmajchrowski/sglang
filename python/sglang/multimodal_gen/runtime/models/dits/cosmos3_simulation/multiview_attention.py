@@ -16,10 +16,14 @@ family uses:
   when the checkpoint tokenizes one caption per camera, and every caption for a
   LiDAR query (``view_id == -2``), which is not scoped to one camera;
 * sensor (RGB or LiDAR target) queries see sensor keys of the same view at any
-  frame and of every view at the same frame, or, with
-  ``decomposed_temporal_window_seconds``, of every view captured within that
-  many seconds *before* the query (past-only, same instant included), which is
-  what registers a 10 Hz LiDAR sweep against 7.5 Hz camera latents;
+  frame and of every view at the same frame, or, with a temporal window, of
+  every view captured within it: ``decomposed_temporal_window_seconds=W`` is the
+  past-only window (at most ``W`` seconds *before* the query, same instant
+  included) and ``temporal_window_bounds=(start, end)`` i4's general form
+  ``start <= key_time - query_time <= end``. Comparing capture times is what
+  registers a 10 Hz LiDAR sweep against 7.5 Hz camera latents. With
+  ``includes_first_frame`` (i4 ``cross_view.attends_first_frame``) every sensor
+  query also sees the sensor keys of frame zero, whatever the window says;
 * sensor queries see control (WSM or HD-map) keys of the same view only;
 * control queries see control keys of the same view only, plus sensor keys of
   the same view when ``control_attends_sensor`` is set;
@@ -47,13 +51,18 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3_simulation.multiview_layo
     MultiviewAttentionContext,
     MultiviewLayout,
     _validate_attention_scope,
-    _validate_temporal_window,
+    _validate_first_frame,
+    resolve_temporal_window_bounds,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 SPARSE_Q_BLOCK_SIZE = 64
+# Tolerance both window edges are widened by, as i4's ``padded_temporal_window``
+# (``DECOMPOSED_TEMPORAL_WINDOW_EPS``): capture times are float32, so a pair
+# meant to land exactly on a boundary may round a hair past it.
+TEMPORAL_WINDOW_EPS = 1e-4
 SPARSE_KV_BLOCK_SIZE = 64
 
 # The default SM100 BF16/FP16 head_dim=128 FlexAttention configuration is
@@ -172,9 +181,12 @@ class MultiviewFlexMetadata(msgspec.Struct, frozen=True, eq=False):
     timestamp: torch.Tensor
     query_start: int
     attention_scope: AttentionScope
-    decomposed_temporal_window_seconds: float | None = None
+    #: The cross-view window as ``(start, end)`` key-time offsets in seconds, or
+    #: None for the frame-index form of the decomposed scope.
+    temporal_window_bounds: tuple[float, float] | None = None
     control_attends_sensor: bool = False
     lidar_attends_captions: bool = True
+    includes_first_frame: bool = False
 
     @property
     def kv_len(self) -> int:
@@ -235,6 +247,8 @@ def build_multiview_flex_metadata(
     control_attends_sensor: bool = False,
     caption_lengths: Sequence[int] = (),
     lidar_attends_captions: bool = True,
+    temporal_window_bounds: tuple[float, float] | None = None,
+    includes_first_frame: bool = False,
 ) -> MultiviewFlexMetadata:
     """Build per-token metadata without materializing a dense mask.
 
@@ -247,7 +261,10 @@ def build_multiview_flex_metadata(
     its caption describes. Empty keeps the sample-level caption (``-1``).
     """
     attention_scope = _validate_attention_scope(attention_scope)
-    _validate_temporal_window(decomposed_temporal_window_seconds)
+    window = resolve_temporal_window_bounds(
+        decomposed_temporal_window_seconds, temporal_window_bounds
+    )
+    _validate_first_frame(includes_first_frame, attention_scope, window)
     if not isinstance(control_attends_sensor, bool):
         raise TypeError("Cosmos3 multiview control_attends_sensor must be boolean.")
     if not isinstance(lidar_attends_captions, bool):
@@ -307,11 +324,7 @@ def build_multiview_flex_metadata(
             start += length
 
     view_offsets = {item.view_offset for item in items}
-    if (
-        attention_scope == "decomposed"
-        and len(view_offsets) > 1
-        and decomposed_temporal_window_seconds is None
-    ):
+    if attention_scope == "decomposed" and len(view_offsets) > 1 and window is None:
         raise ValueError(
             "Cosmos3 decomposed attention does not support mixed view offsets "
             "without a temporal window."
@@ -369,9 +382,10 @@ def build_multiview_flex_metadata(
         timestamp=timestamp,
         query_start=offsets[0],
         attention_scope=attention_scope,
-        decomposed_temporal_window_seconds=decomposed_temporal_window_seconds,
+        temporal_window_bounds=window,
         control_attends_sensor=control_attends_sensor,
         lidar_attends_captions=lidar_attends_captions,
+        includes_first_frame=includes_first_frame,
     )
 
 
@@ -379,9 +393,10 @@ def _make_pair_allowed(
     q_vectors: tuple[torch.Tensor, ...],
     k_vectors: tuple[torch.Tensor, ...],
     attention_scope: AttentionScope,
-    decomposed_temporal_window_seconds: float | None,
+    temporal_window_bounds: tuple[float, float] | None,
     control_attends_sensor: bool,
     lidar_attends_captions: bool = True,
+    includes_first_frame: bool = False,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
     """Build the exact pair predicate with tensor-only traced configuration.
 
@@ -397,16 +412,28 @@ def _make_pair_allowed(
     control_reaches_sensor = torch.tensor(control_attends_sensor, device=device)
     lidar_reads_captions = torch.tensor(lidar_attends_captions, device=device)
     has_temporal_window = torch.tensor(
-        decomposed_temporal_window_seconds is not None, device=device
+        temporal_window_bounds is not None, device=device
     )
-    temporal_window = torch.tensor(
-        0.0
-        if decomposed_temporal_window_seconds is None
-        else decomposed_temporal_window_seconds,
-        dtype=torch.float32,
-        device=device,
+    # i4 ``padded_temporal_window``: both edges widened in float64, then one
+    # float32 scalar each (separate allocations keep FA4-lowerable offsets).
+    window_start, window_end = (
+        (0.0, 0.0)
+        if temporal_window_bounds is None
+        else (
+            temporal_window_bounds[0] - TEMPORAL_WINDOW_EPS,
+            temporal_window_bounds[1] + TEMPORAL_WINDOW_EPS,
+        )
     )
-    temporal_window_eps = torch.tensor(1e-4, dtype=torch.float32, device=device)
+    temporal_window_start = torch.tensor(
+        window_start, dtype=torch.float32, device=device
+    )
+    temporal_window_end = torch.tensor(window_end, dtype=torch.float32, device=device)
+    # i4 ``includes_first_frame``: the sensor keys of frame zero -- not text, not
+    # control, not padding (frame -1) -- join every sensor query's cross-view reach.
+    if includes_first_frame:
+        first_sensor_frame = (~k_vectors[4]) & (~k_vectors[3]) & (k_vectors[1] == 0)
+    else:
+        first_sensor_frame = torch.zeros_like(k_vectors[3])
 
     def pair_allowed(q_index: torch.Tensor, kv_index: torch.Tensor) -> torch.Tensor:
         q_sample = q_vectors[0][q_index]
@@ -426,15 +453,15 @@ def _make_pair_allowed(
         same_sample = q_sample == k_sample
         same_view = q_view == k_view
         same_frame = q_frame == k_frame
-        # Past-only capture-time window: a key captured at or before the query,
-        # no more than ``temporal_window`` seconds earlier (the reference's
-        # (-window, 0) bounds).
-        timestamp_gap = q_timestamp - k_timestamp
-        within_temporal_window = (timestamp_gap >= -temporal_window_eps) & (
-            timestamp_gap <= temporal_window + temporal_window_eps
+        # Capture-time window: start <= key_time - query_time <= end, so the
+        # past-only (-W, 0) admits keys captured at or up to W seconds before.
+        timestamp_offset = k_timestamp - q_timestamp
+        within_temporal_window = (timestamp_offset >= temporal_window_start) & (
+            timestamp_offset <= temporal_window_end
         )
-        reaches_own_instant = is_decomposed & torch.where(
-            has_temporal_window, within_temporal_window, same_frame
+        reaches_own_instant = is_decomposed & (
+            torch.where(has_temporal_window, within_temporal_window, same_frame)
+            | first_sensor_frame[kv_index]
         )
         in_scope = reaches_every_view | same_view | reaches_own_instant
 
@@ -574,9 +601,10 @@ class MultiviewBlockSparsity(msgspec.Struct, frozen=True, eq=False):
             metadata.query_vectors(),
             metadata.key_vectors(),
             metadata.attention_scope,
-            metadata.decomposed_temporal_window_seconds,
+            metadata.temporal_window_bounds,
             metadata.control_attends_sensor,
             metadata.lidar_attends_captions,
+            metadata.includes_first_frame,
         )
 
         def mask_mod(
@@ -621,9 +649,10 @@ def build_multiview_block_sparsity(
         q_vectors,
         k_vectors,
         metadata.attention_scope,
-        metadata.decomposed_temporal_window_seconds,
+        metadata.temporal_window_bounds,
         metadata.control_attends_sensor,
         metadata.lidar_attends_captions,
+        metadata.includes_first_frame,
     )
     group_allowed = pair_allowed(q_representatives[:, None], k_representatives[None, :])
     q_presence = _block_group_presence(
@@ -735,10 +764,11 @@ def get_multiview_attention_plan(
         device=device,
         num_und=real_und_len,
         attention_scope=layout.attention_scope,
-        decomposed_temporal_window_seconds=layout.decomposed_temporal_window_seconds,
+        temporal_window_bounds=layout.window_bounds,
         control_attends_sensor=layout.control_attends_sensor,
         caption_lengths=layout.caption_lengths,
         lidar_attends_captions=layout.lidar_attends_captions,
+        includes_first_frame=layout.includes_first_frame,
     )
     sparsity = build_multiview_block_sparsity(
         metadata,

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Cosmos3-Nano-Transfer-Auto (Multiview-AV) transformer.
+"""Cosmos3 multiview transformer: Nano Transfer-Auto (Multiview-AV) and Cosmos3.5 Ultra.
 
 Same weights and layer stack as ``Cosmos3OmniTransformer``. Two things change
 inside the network. The GEN cross-attention runs the masked block-sparse
@@ -35,7 +35,7 @@ import torch.nn as nn
 from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3_multiview import (
-    COSMOS3_MULTIVIEW_BACKBONE_TYPE,
+    COSMOS3_MULTIVIEW_BACKBONE_TYPES,
     parse_multiview_deployment_config,
 )
 from sglang.multimodal_gen.runtime.distributed import (
@@ -144,6 +144,44 @@ def unpatchify_lidar(
     return x[:, :, :, :height, :width]
 
 
+def multiview_kv_head_repeats(kv_heads: int, world_size: int) -> int:
+    """Copies of each GEN K/V head so ``world_size`` Ulysses ranks each own whole heads.
+
+    i4's context-parallel split (``rigrope_local_head_masks``,
+    ``flex_cudnn`` ``local_kv_heads``): every KV head is first repeated
+    ``max(world_size // kv_heads, 1)`` times, adjacent copies together, then the
+    head axis is cut into contiguous per-rank chunks. Ultra's four KV heads under
+    ``--ulysses-degree 8`` become eight, one per rank, each still serving the
+    query heads of its group. Exact: a copied head attends identically.
+    """
+    if kv_heads <= 0 or world_size <= 0:
+        raise ValueError(
+            f"Cosmos3 multiview needs positive head and rank counts, got {kv_heads=} {world_size=}."
+        )
+    if kv_heads % world_size == 0:
+        return 1
+    if world_size % kv_heads == 0:
+        return world_size // kv_heads
+    raise ValueError(
+        f"Cosmos3 multiview Ulysses degree {world_size} must divide the {kv_heads} "
+        "key/value heads or be a multiple of them."
+    )
+
+
+def validate_multiview_ulysses_degree(
+    degree: int, num_heads: int, num_kv_heads: int
+) -> None:
+    """Reject a Ulysses degree the multiview attention cannot shard heads over."""
+    if degree <= 1:
+        return
+    if num_heads % degree:
+        raise ValueError(
+            f"Cosmos3 multiview --ulysses-degree {degree} must divide the "
+            f"{num_heads} query heads."
+        )
+    multiview_kv_head_repeats(num_kv_heads, degree)
+
+
 def add_rig_view_rows(
     hidden: torch.Tensor, rows: torch.Tensor, num_views: int
 ) -> torch.Tensor:
@@ -198,11 +236,17 @@ class Cosmos3MultiviewCrossAttention(Cosmos3CrossAttention):
                 "only; set ring_degree=1."
             )
         heads, kv_heads = q.shape[2], k.shape[2]
-        if heads % world_size or kv_heads % world_size:
-            raise ValueError(
-                f"Cosmos3 multiview Ulysses degree {world_size} must divide the "
-                f"{heads} query and {kv_heads} key/value heads."
-            )
+        validate_multiview_ulysses_degree(world_size, heads, kv_heads)
+        repeats = multiview_kv_head_repeats(kv_heads, world_size)
+        if repeats > 1:
+            # Fewer K/V heads than ranks (Ultra: 4): copy each head so every rank
+            # owns one, as i4's context-parallel split does. The cached UND K/V
+            # already carries the GEN head count, so it is copied alike.
+            k = k.repeat_interleave(repeats, dim=2)
+            v = v.repeat_interleave(repeats, dim=2)
+            k_und = k_und.repeat_interleave(repeats, dim=2)
+            v_und = v_und.repeat_interleave(repeats, dim=2)
+            kv_heads *= repeats
         # Sequence-sharded [B, S_local, H, D] -> head-sharded [B, S_padded, H/N, D].
         q = _usp_input_all_to_all(q, head_dim=2)
         k = _usp_input_all_to_all(k, head_dim=2)
@@ -276,10 +320,11 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
         backbone_type = (
             hf_config.get("backbone_type") if isinstance(hf_config, dict) else None
         )
-        if backbone_type != COSMOS3_MULTIVIEW_BACKBONE_TYPE:
+        if backbone_type not in COSMOS3_MULTIVIEW_BACKBONE_TYPES:
             raise ValueError(
                 "Cosmos3MultiviewTransformer requires transformer/config.json "
-                f"backbone_type={COSMOS3_MULTIVIEW_BACKBONE_TYPE!r}, got {backbone_type!r}."
+                f"backbone_type in {list(COSMOS3_MULTIVIEW_BACKBONE_TYPES)}, "
+                f"got {backbone_type!r}."
             )
         super().__init__(config, hf_config, quant_config)
         deployment = parse_multiview_deployment_config(hf_config)
@@ -312,13 +357,20 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
                 prefix="lidar_proj_out",
             )
         # Physical rig identity: one trained row per MADS camera id plus a final
-        # LiDAR row, added to control and target tokens alike.
+        # LiDAR row, added to control and target tokens alike. Checkpoints trained
+        # without rig embeddings (i4 ``num_view_embeddings=0``, the Cosmos3.5
+        # Ultra multiview recipes) declare none and add nothing.
         rig = deployment.rig_view_embedding
-        self.rig_view_embed = nn.Embedding(int(rig["num_embeddings"]), self.hidden_size)
-        self.rig_lidar_id = int(rig["lidar_id"])
-        # A checkpoint without the rig table would run on random rows and no
-        # error; the loader turns the missing tensor into a hard failure.
-        self.rig_view_embed.weight.missing_param_init = "error"
+        self.rig_view_embed: nn.Embedding | None = None
+        self.rig_lidar_id: int | None = None
+        if rig is not None:
+            self.rig_view_embed = nn.Embedding(
+                int(rig["num_embeddings"]), self.hidden_size
+            )
+            self.rig_lidar_id = int(rig["lidar_id"])
+            # A checkpoint without the rig table would run on random rows and no
+            # error; the loader turns the missing tensor into a hard failure.
+            self.rig_view_embed.weight.missing_param_init = "error"
         # Request-local attention caches, built once per request rather than
         # once per layer: block masks / block sparsity, and the kernels' padded
         # q/k/v packing buffers.
@@ -443,6 +495,52 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
             dtype = torch.promote_types(dtype, block.dtype)
         return torch.cat([block.to(dtype) for block in blocks], dim=1)
 
+    def _layout_streams(
+        self,
+        multiview_layout: MultiviewLayout,
+        targets: Sequence[torch.Tensor],
+        control_latents: torch.Tensor | list[torch.Tensor] | None,
+        lidar_control_latents: torch.Tensor | None,
+    ) -> tuple[list[torch.Tensor], tuple[MaskItem, ...]]:
+        """Pair every packed layout item with its latent, in sequence order.
+
+        Targets (the sampler state, one per non-control item) and controls (one
+        per control item: ``control_latents`` then ``lidar_control_latents``)
+        are consumed in layout order, so the same code packs camera-only,
+        joint camera/LiDAR and LiDAR-only requests. Without controls (an
+        uncontrolled request, or the dropped-control CFG branch) every control
+        item leaves the layout.
+        """
+        controls = (
+            list(control_latents)
+            if isinstance(control_latents, (list, tuple))
+            else ([control_latents] if control_latents is not None else [])
+        )
+        has_control = bool(controls)
+        if has_control and lidar_control_latents is not None:
+            controls.append(lidar_control_latents)
+        items = tuple(
+            item
+            for item in multiview_layout.items
+            if has_control or not item.is_control
+        )
+        num_controls = sum(item.is_control for item in items)
+        num_targets = len(items) - num_controls
+        if len(controls) != num_controls or len(targets) != num_targets:
+            raise ValueError(
+                "Packed sensor streams do not match the layout items: "
+                f"controls={len(controls)}, targets={len(targets)}, control items="
+                f"{num_controls}, target items={num_targets}."
+            )
+        if any(item.is_lidar for item in items) and self.lidar_config is None:
+            raise ValueError("LiDAR requests need a checkpoint with LiDAR projections.")
+        control_iter, target_iter = iter(controls), iter(targets)
+        streams = [
+            next(control_iter) if item.is_control else next(target_iter)
+            for item in items
+        ]
+        return streams, items
+
     def _frame_token_mask(
         self, frame_mask: torch.Tensor, item: MaskItem, dtype: torch.dtype
     ) -> torch.Tensor:
@@ -473,50 +571,13 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
     ) -> torch.Tensor:
         del text_mask  # Captions arrive compacted; their boundaries are the lengths.
         targets = unpack_state(hidden_states, packed_shapes)
-        camera = targets[0]
-        batch_size = camera.shape[0]
-        device = camera.device
+        batch_size = targets[0].shape[0]
+        device = targets[0].device
         # The sampler state may be float32; the transformer runs in its weight dtype.
         dtype = self.proj_in.weight.dtype
-        controls = (
-            list(control_latents)
-            if isinstance(control_latents, (list, tuple))
-            else ([control_latents] if control_latents is not None else [])
+        streams, items = self._layout_streams(
+            multiview_layout, targets, control_latents, lidar_control_latents
         )
-        if len(controls) > 1:
-            raise ValueError(
-                "Cosmos3 multiview packs exactly one WSM control item, "
-                f"got {len(controls)}."
-            )
-        has_control = bool(controls)
-        items = tuple(
-            item
-            for item in multiview_layout.items
-            if has_control or not item.is_control
-        )
-        streams: list[torch.Tensor] = []
-        if has_control:
-            streams.append(controls[0])
-        streams.append(camera)
-        if len(targets) == 2:
-            if self.lidar_config is None:
-                raise ValueError(
-                    "Joint camera/LiDAR requests need a checkpoint with LiDAR projections."
-                )
-            if has_control:
-                if lidar_control_latents is None:
-                    raise ValueError("Joint transfer requires LiDAR control latents.")
-                streams.append(lidar_control_latents)
-            streams.append(targets[1])
-        elif len(targets) != 1:
-            raise ValueError(
-                f"Cosmos3 multiview packs one camera target and at most one LiDAR target, got {len(targets)}."
-            )
-        if len(streams) != len(items):
-            raise ValueError(
-                "Packed sensor streams do not match the layout items: "
-                f"streams={len(streams)}, items={len(items)}."
-            )
         for item, latent in zip(items, streams, strict=True):
             _, _, latent_t, latent_h, latent_w = latent.shape
             if item.is_lidar:
@@ -538,14 +599,15 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
         context = MultiviewAttentionContext(
             layout, self._multiview_mask_cache, self._multiview_buffer_cache
         )
-        if rig_view_ids is None:
-            raise ValueError(
-                "Cosmos3 multiview requires the request's physical camera IDs."
-            )
-        if rig_view_ids.numel() != multiview_layout.num_views:
-            raise ValueError(
-                f"Expected {multiview_layout.num_views} rig view IDs, got {rig_view_ids.numel()}."
-            )
+        if self.rig_view_embed is not None and any(not item.is_lidar for item in items):
+            if rig_view_ids is None:
+                raise ValueError(
+                    "Cosmos3 multiview requires the request's physical camera IDs."
+                )
+            if rig_view_ids.numel() != multiview_layout.num_views:
+                raise ValueError(
+                    f"Expected {multiview_layout.num_views} rig view IDs, got {rig_view_ids.numel()}."
+                )
 
         self._ensure_cache_dicts()
         if (
@@ -601,11 +663,12 @@ class Cosmos3MultiviewTransformer(Cosmos3OmniTransformer):
                     self.patchify(latent.to(dtype), *latent.shape[2:])
                 )
             # Reference order: projection, then rig identity, then timestep.
-            if item.is_lidar:
-                rows = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
-            else:
-                rows = self.rig_view_embed.weight[rig_view_ids]
-            hidden = add_rig_view_rows(hidden, rows, item.num_views)
+            if self.rig_view_embed is not None:
+                if item.is_lidar:
+                    rows = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
+                else:
+                    rows = self.rig_view_embed.weight[rig_view_ids]
+                hidden = add_rig_view_rows(hidden, rows, item.num_views)
             if not item.is_control:
                 frame_mask = (
                     target_frame_masks[target_index]

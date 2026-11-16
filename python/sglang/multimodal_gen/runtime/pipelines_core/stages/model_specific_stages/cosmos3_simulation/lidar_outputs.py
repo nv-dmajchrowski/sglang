@@ -66,6 +66,24 @@ def render_lidar_range_frames(
     return frames
 
 
+def lidar_range_preview_video(
+    clip: torch.Tensor, *, min_range_m: float, max_range_m: float
+) -> torch.Tensor:
+    """The range preview as a ``[1, 3, T, H, W]`` clip in ``[-1, 1]``, a decoded-video stand-in.
+
+    LiDAR-only requests have no camera video; this is what the video output carries.
+    """
+    preview = pool_lidar_azimuth(clip.detach().float().cpu(), _PREVIEW_AZIMUTH_POOL)
+    frames = _stretch_rows(
+        render_lidar_range_frames(
+            preview, min_range_m=min_range_m, max_range_m=max_range_m
+        ),
+        _PREVIEW_ROW_SCALE,
+    )
+    video = torch.from_numpy(np.ascontiguousarray(frames)).permute(3, 0, 1, 2)
+    return video.float().div(127.5).sub(1.0).unsqueeze(0)
+
+
 def render_lidar_intensity_frames(
     clip: torch.Tensor, *, display_gain: bool = False
 ) -> np.ndarray:

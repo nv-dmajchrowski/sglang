@@ -80,6 +80,79 @@ def _validate_temporal_window(value: Any) -> None:
         )
 
 
+def validate_temporal_window_bounds(
+    value: Any,
+) -> tuple[float, float] | None:
+    """Explicit ``(start, end)`` key-time offsets from the query, in seconds.
+
+    The i4 ``mask.cross_view.temporal_window_bounds`` form: a key is in the
+    query's cross-view reach when ``start <= key_time - query_time <= end``.
+    ``(-W, 0)`` is the past-only window, ``(-W, W)`` a symmetric one.
+    """
+    if value is None:
+        return None
+    if (
+        not isinstance(value, list | tuple)
+        or len(value) != 2
+        or not all(
+            not isinstance(bound, bool)
+            and isinstance(bound, int | float)
+            and math.isfinite(bound)
+            for bound in value
+        )
+    ):
+        raise ValueError(
+            "Cosmos3 multiview temporal window bounds must be two finite numbers "
+            f"(start, end), got {value!r}."
+        )
+    start, end = float(value[0]), float(value[1])
+    if start > end:
+        raise ValueError(
+            f"Cosmos3 multiview temporal window bounds need start <= end, got {value!r}."
+        )
+    return start, end
+
+
+def resolve_temporal_window_bounds(
+    decomposed_temporal_window_seconds: float | None,
+    temporal_window_bounds: Any,
+) -> tuple[float, float] | None:
+    """One ``(start, end)`` window from either spelling, or None for the frame-index form.
+
+    ``decomposed_temporal_window_seconds=W`` is the past-only window ``(-W, 0)``
+    of the vLLM-Omni contract; ``temporal_window_bounds`` is i4's general form.
+    """
+    _validate_temporal_window(decomposed_temporal_window_seconds)
+    bounds = validate_temporal_window_bounds(temporal_window_bounds)
+    if decomposed_temporal_window_seconds is not None and bounds is not None:
+        raise ValueError(
+            "Cosmos3 multiview takes either decomposed_temporal_window_seconds or "
+            "temporal_window_bounds, not both."
+        )
+    if decomposed_temporal_window_seconds is not None:
+        return -float(decomposed_temporal_window_seconds), 0.0
+    return bounds
+
+
+def _validate_first_frame(
+    includes_first_frame: Any,
+    attention_scope: str,
+    bounds: tuple[float, float] | None,
+) -> None:
+    if not isinstance(includes_first_frame, bool):
+        raise TypeError(
+            "Cosmos3 multiview includes_first_frame must be boolean, "
+            f"got {type(includes_first_frame).__name__}."
+        )
+    if includes_first_frame and (attention_scope != "decomposed" or bounds is None):
+        # i4 FlexMetadata: the anchor widens the windowed form of the decomposed
+        # scope; without a window the cross-view pass compares frame indexes.
+        raise ValueError(
+            "Cosmos3 multiview includes_first_frame requires attention_scope="
+            "'decomposed' and a temporal window."
+        )
+
+
 class MaskItem(msgspec.Struct, frozen=True):
     """Semantic description of one packed sensor item.
 
@@ -124,6 +197,8 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
     patch_height: int
     patch_width: int
     attention_scope: AttentionScope = "decomposed"
+    #: Past-only cross-view window ``W`` (the vLLM-Omni contract): keys captured
+    #: at most ``W`` seconds before the query. Equivalent to bounds ``(-W, 0)``.
     decomposed_temporal_window_seconds: float | None = None
     control_attends_sensor: bool = False
     seconds_per_frame: float = 1.0
@@ -144,9 +219,22 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
     caption_lengths: tuple[int, ...] = ()
     #: Whether LiDAR tokens read the sample's captions.
     lidar_attends_captions: bool = True
+    #: i4's general cross-view window ``(start, end)``: a key of another view is
+    #: visible when ``start <= key_time - query_time <= end`` (seconds). Mutually
+    #: exclusive with ``decomposed_temporal_window_seconds``.
+    temporal_window_bounds: tuple[float, float] | None = None
+    #: i4 ``mask.cross_view.attends_first_frame``: every sensor query also reads
+    #: the other streams' sensor keys at frame zero, whatever the window says.
+    includes_first_frame: bool = False
 
     def __post_init__(self) -> None:
         _validate_attention_scope(self.attention_scope)
+        bounds = resolve_temporal_window_bounds(
+            self.decomposed_temporal_window_seconds, self.temporal_window_bounds
+        )
+        if self.temporal_window_bounds is not None:
+            msgspec.structs.force_setattr(self, "temporal_window_bounds", bounds)
+        _validate_first_frame(self.includes_first_frame, self.attention_scope, bounds)
         validate_multiview_backend(self.backend)
         if self.max_und_tokens <= 0:
             raise ValueError(
@@ -210,6 +298,13 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
         _validate_positive_finite(self.seconds_per_frame, "seconds_per_frame")
 
     @property
+    def window_bounds(self) -> tuple[float, float] | None:
+        """The cross-view window as ``(start, end)``, whichever spelling set it."""
+        return resolve_temporal_window_bounds(
+            self.decomposed_temporal_window_seconds, self.temporal_window_bounds
+        )
+
+    @property
     def frames_per_view(self) -> int:
         return self.latent_frames // self.num_views
 
@@ -237,6 +332,8 @@ class MultiviewLayout(msgspec.Struct, frozen=True):
             self.items,
             self.caption_lengths,
             self.lidar_attends_captions,
+            self.temporal_window_bounds,
+            self.includes_first_frame,
         )
 
 
