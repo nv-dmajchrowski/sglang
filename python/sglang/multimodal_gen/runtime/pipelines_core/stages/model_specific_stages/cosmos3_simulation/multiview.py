@@ -141,11 +141,13 @@ COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM = (
     "weather, lighting, cross-view consistency, and camera-LiDAR alignment.\n\n"
     f"{COSMOS3_AV_WSM_CONTROL_INSTRUCTION}"
 )
-# Control-adherence sentences appended to every caption after the metadata.
-COSMOS3_MULTIVIEW_EMPHASIS = (
-    "Follow the wsm control videos precisely for every camera view: shape, contour, "
-    "position, and motion must align with the wsm signal at every frame."
+# Control-adherence sentences appended to every caption after the metadata
+# (imaginaire4 ``multiview_captions.control_emphasis``), naming the request's hint.
+COSMOS3_MULTIVIEW_EMPHASIS_TEMPLATE = (
+    "Follow the {hint} control videos precisely for every camera view: shape, contour, "
+    "position, and motion must align with the {hint} signal at every frame."
 )
+COSMOS3_MULTIVIEW_EMPHASIS = COSMOS3_MULTIVIEW_EMPHASIS_TEMPLATE.format(hint="wsm")
 COSMOS3_JOINT_EMPHASIS = (
     "Follow the wsm and lidar control videos precisely: every camera view must align "
     "with its world-scenario map, and the LiDAR rangemap must align with the HD-map "
@@ -924,7 +926,13 @@ class Cosmos3MultiviewTokenizationStage(Cosmos3TokenizationStage):
         captions = list(batch.extra[EXTRA_VIEW_PROMPTS])
         emphasis = None
         if emphasize:
-            emphasis = COSMOS3_JOINT_EMPHASIS if joint else COSMOS3_MULTIVIEW_EMPHASIS
+            emphasis = (
+                COSMOS3_JOINT_EMPHASIS
+                if joint
+                else COSMOS3_MULTIVIEW_EMPHASIS_TEMPLATE.format(
+                    hint=batch.sampling_params.resolved_transfer_hint()
+                )
+            )
         prompts = format_per_view_prompts(
             captions,
             cameras,

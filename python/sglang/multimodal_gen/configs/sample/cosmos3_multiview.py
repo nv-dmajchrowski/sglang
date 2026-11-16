@@ -22,7 +22,10 @@ input JSON::
       "lidar": {"control_path": "hdmap_rangemap.safetensors"}
     }
 
-Every view needs a pre-computed WSM ``control_path``. ``vision_path`` (an RGB
+Every view needs a pre-computed ``control_path``. The request names its one
+control hint at the top level (``wsm``, ``edge``, ``blur``, ``depth`` or
+``seg``: ``{}`` or ``{"weight": ...}``; ``wsm`` when none is given), which the
+control-emphasis sentence names. ``vision_path`` (an RGB
 still or clip) is optional but must be given for every camera or none; with it
 the request is image-to-video, without it text-to-video. Every camera takes its
 caption in ``views[].prompt``. ``lidar`` selects joint camera/LiDAR generation on exports that ship
@@ -40,8 +43,11 @@ from typing import Any
 import msgspec
 
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
+    COSMOS3_TRANSFER_HINT_KEYS,
     Cosmos3SamplingParams,
+    Cosmos3TransferHint,
     _parse_request_value,
+    parse_transfer_hint_object,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -226,7 +232,7 @@ def validate_multiview_request(multiview: Any) -> list[dict[str, Any]]:
         control = _view_value(view, "control")
         if not isinstance(control, str) or not control.strip():
             raise ValueError(
-                f"multiview.views[{index}] requires a pre-computed WSM control_path."
+                f"multiview.views[{index}] requires a pre-computed control_path."
             )
         vision = _view_value(view, "vision")
         if vision is not None and (not isinstance(vision, str) or not vision.strip()):
@@ -364,8 +370,9 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
 
     # Per-camera inputs; see the module docstring for the schema.
     multiview: dict[str, Any] | None = None
-    # The only supported control hint. ``{}``/``true`` select it explicitly;
-    # None is accepted because every view already carries a WSM control clip.
+    # The one control hint (``wsm`` / ``edge`` / ``blur`` / ``depth`` / ``seg``,
+    # inherited fields): ``{}``/``true`` or ``{"weight": ...}``; the per-view
+    # clips carry the controls. None everywhere selects ``wsm``.
     wsm: Any = None
     # Joint camera/LiDAR: one prepared HD-map range-map control clip.
     lidar: dict[str, Any] | None = None
@@ -392,6 +399,8 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
     # Captions are read per camera from multiview.views[].prompt, so the video
     # API must not require the top-level prompt.
     prompt_optional = True
+    # Not single-view transfer: frames follow num_frames per camera.
+    _single_view_transfer = False
 
     @classmethod
     def video_request_extra_fields(cls) -> frozenset[str]:
@@ -538,6 +547,52 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
             else bool(self.emphasize_control_in_prompt)
         )
 
+    def resolve_transfer_hints(self) -> list[Cosmos3TransferHint]:
+        """The request's one control hint, as imaginaire4 admits it for multiview.
+
+        Exactly one hint; its controls come from ``multiview.views[*].control_path``,
+        so a hint-level ``control_path`` is refused. Without a hint the request is
+        WSM transfer (every view already carries a control clip).
+        """
+        objects = [
+            parse_transfer_hint_object(key, getattr(self, key))
+            for key in COSMOS3_TRANSFER_HINT_KEYS
+            if getattr(self, key) is not None
+        ]
+        named = list(dict.fromkeys(self._resolve_control_hints()))
+        if objects and named:
+            raise ValueError(
+                "Cosmos3 multiview takes its control hint either as a top-level hint "
+                "object or as control_hint, not both."
+            )
+        if len(objects) > 1 or len(named) > 1:
+            raise ValueError(
+                "Multiview transfer inference currently supports one transfer "
+                "hint/control tensor."
+            )
+        if self.control_weight is not None:
+            raise ValueError(
+                "Cosmos3 multiview takes the control weight as <hint>.weight, not "
+                "control_weight."
+            )
+        if objects:
+            hint = objects[0]
+            if hint.control_path is not None:
+                raise ValueError(
+                    "Multiview transfer inference uses per-view control_path; do not "
+                    f"also set {hint.key}.control_path."
+                )
+        else:
+            hint = Cosmos3TransferHint(key=named[0] if named else "wsm")
+        if hint.weight <= 0:
+            raise ValueError(
+                f"Cosmos3 multiview {hint.key}.weight must be positive, got {hint.weight}."
+            )
+        return [hint]
+
+    def resolved_transfer_hint(self) -> str:
+        return str(self.resolve_transfer_hints()[0].key)
+
     # -- Validation and adjustment ------------------------------------------
 
     def _validate(self) -> None:
@@ -546,12 +601,11 @@ class Cosmos3MultiviewSamplingParams(Cosmos3SamplingParams):
             validate_multiview_request(self.multiview)
         if self.lidar is not None:
             validate_lidar_request(self.lidar)
-        if self.wsm is not None and self.wsm is not True:
-            if not isinstance(self.wsm, dict) or set(self.wsm) - {"weight"}:
-                raise ValueError(
-                    "Cosmos3 multiview WSM controls are supplied per view; the "
-                    "top-level wsm must be true or an empty object."
-                )
+        hint = self.resolved_transfer_hint()
+        if self.lidar is not None and hint != "wsm":
+            raise ValueError(
+                f"Joint camera/LiDAR transfer requires the wsm hint, got {hint!r}."
+            )
         if self.resolution is not None:
             normalize_multiview_resolution(self.resolution)
         normalize_multiview_aspect_ratio(self.aspect_ratio)

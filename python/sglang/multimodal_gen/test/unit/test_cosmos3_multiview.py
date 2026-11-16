@@ -105,7 +105,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     COSMOS3_AV_JOINT_TRANSFER_SYSTEM_PROMPT_WSM,
     COSMOS3_AV_MULTIVIEW_TRANSFER_SYSTEM_PROMPT_WSM,
     COSMOS3_MULTIVIEW_EMPHASIS,
+    COSMOS3_MULTIVIEW_EMPHASIS_TEMPLATE,
     Cosmos3MultiviewInputStage,
+    Cosmos3MultiviewTokenizationStage,
     fit_uint8_cthw,
     format_per_view_negative_prompt,
     format_per_view_prompts,
@@ -1733,6 +1735,85 @@ class TestPerViewCaptions(unittest.TestCase):
                 f"480x832 resolution. {COSMOS3_MULTIVIEW_EMPHASIS}"
             )
         )
+
+    def test_multiview_admits_one_hint_of_any_type(self):
+        """imaginaire4 admits exactly one hint of any key; per-view clips carry it."""
+        self.assertEqual(
+            Cosmos3MultiviewSamplingParams().resolved_transfer_hint(), "wsm"
+        )
+        for kwargs, hint in (
+            (dict(edge={}), "edge"),
+            (dict(seg={"weight": 2.0}), "seg"),
+            (dict(blur=True), "blur"),
+            (dict(control_hint="depth"), "depth"),
+        ):
+            params = Cosmos3MultiviewSamplingParams(**kwargs)
+            self.assertEqual(params.resolved_transfer_hint(), hint)
+        for kwargs, message in (
+            (dict(edge={}, wsm={}), "one transfer hint"),
+            (dict(control_hint=["edge", "seg"]), "one transfer hint"),
+            (dict(depth={"control_path": "d.mp4"}), "per-view control_path"),
+            (dict(wsm={"weight": 0}), "must be positive"),
+            (dict(control_weight=1.0), "control_weight"),
+            (
+                dict(edge={}, lidar={"control_path": "h.safetensors"}),
+                "requires the wsm hint",
+            ),
+        ):
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                Cosmos3MultiviewSamplingParams(**kwargs)
+
+    def test_emphasis_names_the_request_hint(self):
+        # imaginaire4 multiview_captions.control_emphasis, verbatim (leading space
+        # supplied by the caption join).
+        self.assertEqual(
+            " " + COSMOS3_MULTIVIEW_EMPHASIS_TEMPLATE.format(hint="seg"),
+            " Follow the seg control videos precisely for every camera view: shape, contour,"
+            " position, and motion must align with the seg signal at every frame.",
+        )
+        self.assertEqual(
+            COSMOS3_MULTIVIEW_EMPHASIS_TEMPLATE.format(hint="wsm"),
+            COSMOS3_MULTIVIEW_EMPHASIS,
+        )
+        stage = Cosmos3MultiviewTokenizationStage.__new__(
+            Cosmos3MultiviewTokenizationStage
+        )
+        stage.deployment = SimpleNamespace(
+            inference_default=lambda name, default: default
+        )
+        seen = []
+
+        def tokenize(texts, cap, device, system_prompt):
+            seen.append(list(texts))
+            return torch.zeros(1, len(texts), dtype=torch.long), tuple([1] * len(texts))
+
+        stage._tokenize_compact = tokenize
+        batch = SimpleNamespace(
+            fps=30,
+            num_frames=17,
+            height=480,
+            width=832,
+            max_sequence_length=None,
+            negative_prompt=None,
+            is_warmup=True,
+            sampling_params=Cosmos3MultiviewSamplingParams(edge={}),
+            extra={
+                multiview_stage.EXTRA_LIDAR_FRAMES: None,
+                multiview_stage.EXTRA_CAMERAS: self.CAMERAS,
+                multiview_stage.EXTRA_VIEW_PROMPTS: ["A car.", "Trees."],
+            },
+        )
+        with mock.patch.object(
+            multiview_stage, "get_local_torch_device", return_value=torch.device("cpu")
+        ):
+            stage.forward(batch, None)
+        for prompt in seen[0]:
+            self.assertTrue(
+                prompt.endswith(COSMOS3_MULTIVIEW_EMPHASIS_TEMPLATE.format(hint="edge"))
+            )
 
     def test_wsm_system_prompts_match_imaginaire4(self):
         # Verbatim from imaginaire4 datasets/augmentors/text_tokenizer.py after
