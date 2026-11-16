@@ -29,6 +29,7 @@ def _mixed_precision_moe_quant_algos(hf_config: Any) -> set:
 @_register_for(
     "Qwen3MoeForCausalLM",
     "Qwen3VLMoeForConditionalGeneration",
+    "CosmosQwen3VLMoeAudioForConditionalGeneration",
     "Qwen3NextForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "InternS2PreviewForConditionalGeneration",

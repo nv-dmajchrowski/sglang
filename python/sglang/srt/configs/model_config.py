@@ -973,6 +973,7 @@ class ModelConfig:
         #   - top-level audio_config: e.g. Qwen2Audio
         #   - thinker_config.audio_config: Qwen3-Omni, Qwen3-ASR (nested thinker arch)
         #   - sound_config: Nemotron AVLM with Parakeet audio encoder
+        #   - cosmos_audio: Cosmos3.5 Reasoner audio export (Qwen3-Omni audio tower)
         #   - is_audio_model(): Whisper, Qwen3-ASR (architecture-based fallback)
         # TODO: Handle this more robustly by standardizing the config structure in the future
         self.is_audio_understandable_model = (
@@ -987,6 +988,7 @@ class ModelConfig:
                 )
                 is not None
                 or getattr(self.hf_config, "sound_config", None) is not None
+                or getattr(self.hf_config, "cosmos_audio", None) is not None
                 or is_audio_model(self.hf_config.architectures)
             )
         )
@@ -2626,6 +2628,7 @@ multimodal_model_archs = [
     "Qwen2_5_VLForConditionalGeneration",
     "Qwen3VLForConditionalGeneration",
     "Qwen3VLMoeForConditionalGeneration",
+    "CosmosQwen3VLMoeAudioForConditionalGeneration",
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen4ExpForConditionalGeneration",

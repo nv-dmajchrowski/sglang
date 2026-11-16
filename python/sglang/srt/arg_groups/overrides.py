@@ -1073,6 +1073,7 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
         "MistralLarge3ForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3VLMoeForConditionalGeneration",
+        "CosmosQwen3VLMoeAudioForConditionalGeneration",
         "Qwen3NextForCausalLM",
         "Qwen4ExpForConditionalGeneration",
         "KimiK25ForConditionalGeneration",

@@ -414,6 +414,17 @@ def _get_processor(
                 revision=revision,
                 **kwargs,
             )
+        elif not trust_remote_code and getattr(config, "cosmos_audio", None):
+            # The Cosmos3.5 audio export maps AutoProcessor to remote code. SGLang
+            # extracts audio itself, so the stock Qwen3-VL processor suffices.
+            from transformers import Qwen3VLProcessor
+
+            processor = Qwen3VLProcessor.from_pretrained(
+                tokenizer_name,
+                *args,
+                revision=revision,
+                **kwargs,
+            )
         else:
             raise
 

@@ -1124,6 +1124,7 @@ class GenerateReqInput:
                 else None
             ),
             mm_processor_kwargs=self.mm_processor_kwargs,
+            use_audio_in_video=self.use_audio_in_video,
             positional_embed_overrides=self._get_positional_embed_overrides_item(i),
             # If `__getitem__` is called, these bootstrap fields must be lists.
             bootstrap_host=(

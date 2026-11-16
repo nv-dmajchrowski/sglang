@@ -251,6 +251,7 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
     return owner.__class__.__name__ in {
         "Qwen3VLForConditionalGeneration",
         "Qwen3VLMoeForConditionalGeneration",
+        "CosmosQwen3VLMoeAudioForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
         "KimiK25ForConditionalGeneration",

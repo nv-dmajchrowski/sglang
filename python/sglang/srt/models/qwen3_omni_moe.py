@@ -80,6 +80,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
         config: Qwen3OmniMoeAudioEncoderConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        use_data_parallel: bool = False,
     ):
         super().__init__()
         embed_dim = config.d_model
@@ -101,13 +102,14 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
+            use_data_parallel=use_data_parallel,
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
         self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
         self.activation_dropout = config.activation_dropout
         tp_size = get_parallel().tp_size
-        use_replicated = config.encoder_ffn_dim % tp_size != 0
+        use_replicated = use_data_parallel or config.encoder_ffn_dim % tp_size != 0
         fc1_cls = ReplicatedLinear if use_replicated else ColumnParallelLinear
         fc2_cls = ReplicatedLinear if use_replicated else RowParallelLinear
         self.fc1 = fc1_cls(
@@ -191,8 +193,22 @@ class SinusoidsPositionEmbedding(nn.Module):
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
     config: Qwen3OmniMoeAudioEncoderConfig
 
-    def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
+    def __init__(
+        self,
+        config: Qwen3OmniMoeAudioEncoderConfig,
+        quant_config=None,
+        use_data_parallel: bool = False,
+        output_pre_projection: bool = False,
+    ):
+        """
+        use_data_parallel: replicate the tower on every rank instead of sharding
+            its attention heads and FFN across TP ranks.
+        output_pre_projection: return the ``ln_post`` output (the input of
+            ``proj1``) instead of the ``proj2`` output. ``proj1``/``proj2`` are
+            still created so checkpoints that carry them load unchanged.
+        """
         super().__init__(config)
+        self.output_pre_projection = output_pre_projection
         self.dropout = config.dropout
 
         embed_dim = config.d_model
@@ -205,7 +221,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         )
         self.layers = nn.ModuleList(
             [
-                Qwen3OmniMoeAudioEncoderLayer(config)
+                Qwen3OmniMoeAudioEncoderLayer(
+                    config, use_data_parallel=use_data_parallel
+                )
                 for _ in range(config.encoder_layers)
             ]
         )
@@ -346,6 +364,8 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
             hidden_states = layer_outputs[0]
 
         hidden_states = self.ln_post(hidden_states)
+        if self.output_pre_projection:
+            return BaseModelOutput(last_hidden_state=hidden_states)
         hidden_states = self.proj1(hidden_states)[0]
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)[0]

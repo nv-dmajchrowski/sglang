@@ -405,6 +405,31 @@ sglang serve \
   --host 0.0.0.0 --port 30000
 ```
 
+### Audio input: Cosmos3.5 Reasoner audio export
+
+The audio-capable Cosmos3.5 Reasoner is exported as a standalone Hugging Face checkpoint with `architectures: ["CosmosQwen3VLMoeAudioForConditionalGeneration"]`: a Qwen3-VL-MoE model plus a Qwen3-Omni audio tower and projector (`cosmos_audio` in `config.json`). It is a plain LLM checkpoint, so it needs neither `--model-type llm` nor `--trust-remote-code`:
+
+```bash Launch Server
+sglang serve --model-path /path/to/cosmos3.5-reasoner-audio --host 0.0.0.0 --port 30000
+```
+
+Audio is passed as OpenAI `input_audio` (`wav` or `mp3`, base64) or `audio_url` content and decoded to 16 kHz mono. Each clip becomes its own `<audio_start><audio_pad><audio_end>` span, expanded to 13 tokens per second of audio; the model was trained on clips of up to 300 s. Audio can be mixed with images and videos in one request. To also feed the soundtrack of each video, set `"use_audio_in_video": true` in the request; the audio of every video becomes a separate span placed right after that video.
+
+```bash Example Request
+curl http://localhost:30000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default",
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "input_audio", "input_audio": {"data": "<base64 wav>", "format": "wav"}},
+        {"type": "text", "text": "Transcribe the speech."}
+      ]
+    }]
+  }'
+```
+
 ## Usage Notes
 
 ### Performance Optimization
