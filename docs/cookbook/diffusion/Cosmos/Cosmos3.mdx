@@ -358,7 +358,7 @@ Poll and download this job with the same status and content endpoints used by th
 
 ### Action generation
 
-For DROID policy generation, start a server with either the Nano or Edge policy checkpoint. One GPU is enough; to split a request across GPUs, use Ulysses sequence parallelism (`--num-gpus 2 --ulysses-degree 2`). Cosmos3 action generation does not support CFG parallel; policy requests run with `guidance_scale=1.0`, so this only matters if you raise the guidance scale on a multi-GPU server.
+For DROID policy generation, start a server with either the Nano or Edge policy checkpoint. One GPU is enough; to split a request across GPUs, use Ulysses sequence parallelism (`--num-gpus 2 --ulysses-degree 2`), or CFG parallelism (`--cfg-parallel-size 2`) when requests raise `guidance_scale` above the default `1.0`.
 
 ```bash Command
 sglang serve \

@@ -36,6 +36,7 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
+    Cosmos3DenoisingStage,
     Cosmos3ImagePreprocessStage,
     Cosmos3LatentPreparationStage,
     Cosmos3TokenizationStage,
@@ -661,6 +662,69 @@ class TestCosmos3WamDecode(unittest.TestCase):
         )
         self.assertEqual(output.action_mode, "wam")
         self.assertEqual(output.action_domain_id, 8)
+
+
+class TestCosmos3ActionCfgParallel(unittest.TestCase):
+    """CFG parallel runs the branches on different ranks; the action prediction
+    must be gathered and combined with the video one, in the serial order."""
+
+    def test_cfg_ranks_reproduce_the_serial_guided_action(self):
+        stage = Cosmos3DenoisingStage.__new__(Cosmos3DenoisingStage)
+        cond_ids = torch.ones(1, 3, dtype=torch.long)
+        uncond_ids = torch.zeros(1, 3, dtype=torch.long)
+        latents = torch.zeros(1, 2, 1, 1, 1)
+        action_latents = torch.arange(6, dtype=torch.float32).reshape(1, 3, 2)
+
+        def branch_outputs(is_cond):
+            sign = 1.0 if is_cond else -1.0
+            return latents + sign, action_latents * 2 + sign
+
+        def fake_run_transformer(*, text_ids, **_kwargs):
+            return branch_outputs(bool(text_ids.all()))
+
+        stage._run_transformer = fake_run_transformer
+        branches = Cosmos3DenoisingStage._text_cfg_branches(
+            cond_ids,
+            torch.ones_like(cond_ids),
+            uncond_ids,
+            torch.ones_like(uncond_ids),
+            guidance_scale=3.0,
+            cond_text_seq_len=3,
+            uncond_text_seq_len=3,
+            control_latents=None,
+        )
+        # Slot 0 of an all-gather over 2 ranks holds branch 0 (cond) from rank 0
+        # and branch 1 (uncond) from rank 1.
+        per_rank = [branch_outputs(True), branch_outputs(False)]
+
+        def fake_gather(pred, dim, separate_tensors):
+            element = 0 if pred.shape == latents.shape else 1
+            return [outputs[element] for outputs in per_rank]
+
+        common = dict(
+            latents=latents,
+            timestep=torch.ones(1),
+            video_shape=(2, 1, 1),
+            fps=24.0,
+            action_latents=action_latents,
+            combine_as_text_cfg=True,
+        )
+        serial = stage._predict_noise_cfg(
+            branches, cfg_rank=0, cfg_world_size=1, **common
+        )
+        with mock.patch(
+            f"{_STAGES}.cfg_model_parallel_all_gather", side_effect=fake_gather
+        ):
+            for rank in range(2):
+                video, action = stage._predict_noise_cfg(
+                    branches, cfg_rank=rank, cfg_world_size=2, **common
+                )
+                torch.testing.assert_close(video, serial[0], rtol=0, atol=0)
+                torch.testing.assert_close(action, serial[1], rtol=0, atol=0)
+        cond_action, uncond_action = branch_outputs(True)[1], branch_outputs(False)[1]
+        torch.testing.assert_close(
+            serial[1], uncond_action + 3.0 * (cond_action - uncond_action)
+        )
 
 
 class TestCosmos3WamTokenization(unittest.TestCase):

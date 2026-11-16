@@ -1729,13 +1729,11 @@ class Cosmos3DenoisingStage(PipelineStage):
         # control-dropped forward), so it can drive CFG parallel on its own.
         any_control_cfg = control_latents is not None and control_guidance != 1.0
 
+        # Action and sound predictions ride in the same per-branch output tuple,
+        # so CFG parallel reduces them with the video prediction.
         enable_cfg_parallel = server_args.enable_cfg_parallel and (
             do_cfg or any_control_cfg
         )
-        if action_latents is not None and enable_cfg_parallel:
-            raise NotImplementedError(
-                "Cosmos3 action generation does not support CFG parallel yet"
-            )
 
         # Use separate scheduler instances for action/sound: UniPC keeps a
         # per-call output history sized to the last sample, so video (5D),
