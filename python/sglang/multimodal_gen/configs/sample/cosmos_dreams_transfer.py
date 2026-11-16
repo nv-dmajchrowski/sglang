@@ -10,6 +10,7 @@ the control-adherence sentence.
 """
 
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     TRANSFER_HINTS,
@@ -36,6 +37,8 @@ class CosmosDreamsTransferSamplingParams(Cosmos3SamplingParams):
     fps: int = 24
     # Guidance is distilled into the weights; the rollout runs one branch.
     guidance_scale: float = 1.0
+    # Not the bidirectional route: num_frames is this pipeline's frame cap.
+    _single_view_transfer: ClassVar[bool] = False
 
     supported_resolutions: list[tuple[int, int]] | None = field(
         default_factory=lambda: list(COSMOS_DREAMS_480P_CANVASES)

@@ -23,9 +23,12 @@ import numpy as np
 import PIL.Image
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
+from sglang.multimodal_gen.configs.sample.cosmos3 import (
+    Cosmos3SamplingParams,
+    Cosmos3TransferHint,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
@@ -74,6 +77,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     load_action_stats,
     normalize_action,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_transfer import (
+    COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    append_control_emphasis,
+    normalize_control_weights,
+    on_the_fly_control_uint8,
+    read_transfer_media_uint8,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -93,11 +103,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import SGLDiffusionProfiler
-from sglang.multimodal_gen.runtime.utils.vision import (
-    load_image,
-    load_video,
-    preprocess_image,
-)
+from sglang.multimodal_gen.runtime.utils.vision import load_image, preprocess_image
 from sglang.srt.environ import envs
 from sglang.srt.utils.device import get_compiler_backend
 
@@ -186,33 +192,6 @@ def _pil_to_normalized_tensor(image: PIL.Image.Image) -> torch.Tensor:
 def _pil_to_uint8_tensor(image: PIL.Image.Image) -> torch.Tensor:
     arr = np.asarray(image, dtype=np.uint8).copy()
     return torch.from_numpy(arr).permute(2, 0, 1).contiguous()
-
-
-def _resize_center_crop_uint8_cthw(
-    frames: torch.Tensor, height: int, width: int
-) -> torch.Tensor:
-    """Resize and center-crop ``uint8 [3, T, H, W]`` transfer frames."""
-    if frames.ndim != 4 or frames.shape[0] != 3:
-        raise ValueError(
-            f"Transfer frames must have shape [3, T, H, W], got {tuple(frames.shape)}"
-        )
-    orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
-    scale = max(width / orig_w, height / orig_h)
-    resize_h = int(np.ceil(scale * orig_h))
-    resize_w = int(np.ceil(scale * orig_w))
-    frames_tchw = frames.permute(1, 0, 2, 3).to(dtype=torch.float32)
-    resized = F.interpolate(
-        frames_tchw,
-        size=(resize_h, resize_w),
-        mode="bilinear",
-        align_corners=False,
-    )
-    top = (resize_h - height) // 2
-    left = (resize_w - width) // 2
-    cropped = resized[:, :, top : top + height, left : left + width]
-    return (
-        cropped.round().clamp(0, 255).to(torch.uint8).permute(1, 0, 2, 3).contiguous()
-    )
 
 
 def _pad_transfer_frames(video: torch.Tensor, target_frames: int) -> torch.Tensor:
@@ -325,28 +304,6 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
 
     parallelism_type = StageParallelismType.REPLICATED
 
-    def _load_control_video(
-        self,
-        control_path: str,
-        target_w: int,
-        target_h: int,
-        max_frames: int,
-    ) -> torch.Tensor:
-        """Load transfer media as CPU ``uint8 [1, 3, T, H, W]``."""
-        frames = load_video(control_path, max_frames=max_frames)
-        if not frames:
-            raise ValueError(f"No frames decoded from transfer video: {control_path!r}")
-        frames = frames[:max_frames]
-        frames_cthw = torch.stack(
-            [_pil_to_uint8_tensor(frame.convert("RGB")) for frame in frames],
-            dim=1,
-        )
-        return (
-            _resize_center_crop_uint8_cthw(frames_cthw, height=target_h, width=target_w)
-            .unsqueeze(0)
-            .contiguous()
-        )
-
     @staticmethod
     def _get_transfer_num_chunks(
         total_frames: int, frames_per_chunk: int, conditional_frames: int
@@ -361,24 +318,63 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         remaining = total_frames - frames_per_chunk
         return 1 + math.ceil(remaining / stride), stride
 
+    @staticmethod
+    def _load_transfer_controls(
+        hints: list[Cosmos3TransferHint],
+        source_video: torch.Tensor | None,
+        *,
+        height: int,
+        width: int,
+        max_frames: int,
+    ) -> list[torch.Tensor]:
+        """Every hint's control clip as uint8 ``[3, T, H, W]``, in hint order."""
+        controls = []
+        for hint in hints:
+            if hint.control_path is not None:
+                frames, _ = read_transfer_media_uint8(
+                    hint.control_path, height=height, width=width, max_frames=max_frames
+                )
+            else:
+                if source_video is None:
+                    raise ValueError(
+                        f"The '{hint.key}' control is computed from video_path; "
+                        "provide video_path or a pre-computed control_path."
+                    )
+                frames = on_the_fly_control_uint8(
+                    source_video, hint=hint.key, preset=hint.preset
+                )
+            controls.append(frames)
+        return controls
+
     def _prepare_transfer_plan(
         self,
         batch: Req,
-        control_paths: list[str],
+        hints: list[Cosmos3TransferHint],
         source_video_path: str | None,
     ) -> None:
-        max_frames = int(batch.sampling_params.max_frames)
-        controls = [
-            self._load_control_video(
-                path, batch.width, batch.height, max_frames=max_frames
+        sampling_params = batch.sampling_params
+        max_frames = int(sampling_params.max_frames)
+        height, width = int(batch.height), int(batch.width)
+        source_video = None
+        source_fps = 0.0
+        if source_video_path:
+            source_video, source_fps = read_transfer_media_uint8(
+                source_video_path, height=height, width=width, max_frames=max_frames
             )
-            for path in control_paths
-        ]
-        total_frames = min(batch.num_frames, controls[0].shape[2], max_frames)
-        if total_frames <= 0:
-            raise ValueError("Cosmos3 transfer requires at least one control frame")
+        if (
+            sampling_params.num_first_chunk_conditional_frames > 0
+            and source_video is None
+        ):
+            raise ValueError(
+                "num_first_chunk_conditional_frames > 0 requires video_path"
+            )
+        controls = self._load_transfer_controls(
+            hints, source_video, height=height, width=width, max_frames=max_frames
+        )
+        # The output follows the first control clip; max_frames already capped the decode.
+        total_frames = int(controls[0].shape[1])
 
-        requested_chunk_frames = int(batch.sampling_params.num_video_frames_per_chunk)
+        requested_chunk_frames = int(sampling_params.num_video_frames_per_chunk)
         chunk_frames = (
             1
             if total_frames == 1
@@ -387,29 +383,20 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         num_chunks, stride = self._get_transfer_num_chunks(
             total_frames,
             chunk_frames,
-            int(batch.sampling_params.num_conditional_frames),
+            int(sampling_params.num_conditional_frames),
         )
         padded_frames = max(total_frames, chunk_frames)
         controls = [
-            _pad_transfer_frames(control, padded_frames) for control in controls
+            _pad_transfer_frames(control.unsqueeze(0), padded_frames)
+            for control in controls
         ]
-
-        source_video = None
-        if source_video_path:
-            source_video = self._load_control_video(
-                source_video_path,
-                batch.width,
-                batch.height,
-                max_frames=max_frames,
+        if source_video is not None:
+            source_video = _pad_transfer_frames(
+                source_video.unsqueeze(0), padded_frames
             )
-            source_video = _pad_transfer_frames(source_video, padded_frames)
-        if (
-            batch.sampling_params.num_first_chunk_conditional_frames > 0
-            and source_video is None
-        ):
-            raise ValueError(
-                "num_first_chunk_conditional_frames > 0 requires video_path"
-            )
+        # The output plays at the source video's rate; without one, at the request fps.
+        if source_fps > 0:
+            batch.fps = int(round(source_fps))
 
         batch.num_frames = total_frames
         batch.extra["preprocessed_control"] = controls
@@ -419,39 +406,16 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
             "chunk_frames": chunk_frames,
             "num_chunks": num_chunks,
             "stride": stride,
+            "hints": [hint.key for hint in hints],
+            "control_weights": normalize_control_weights(
+                [hint.weight for hint in hints]
+            ),
+            "output_fps": int(batch.fps),
         }
         self.log_info(
-            f"Prepared transfer plan with {len(controls)} control(s), "
-            f"{total_frames} output frames, {num_chunks} chunk(s) of "
-            f"{chunk_frames} frames"
-        )
-
-    @staticmethod
-    def _normalize_control_paths(control_path: Any) -> list[str]:
-        """Normalize ``control_path`` (str / list / None) to a list of paths.
-
-        Multiple paths drive multi-hint transfer (e.g. ``[edge.mp4, depth.mp4]``):
-        each is VAE-encoded into its own control-latent block and all blocks
-        prefix the target clip in the GEN sequence.
-        """
-        if control_path is None:
-            return []
-        if isinstance(control_path, str):
-            if not control_path.strip():
-                raise ValueError("control_path is an empty string")
-            return [control_path]
-        if isinstance(control_path, (list, tuple)):
-            paths: list[str] = []
-            for i, p in enumerate(control_path):
-                if not isinstance(p, str) or not p.strip():
-                    raise ValueError(
-                        f"control_path[{i}] must be a non-empty string, got {p!r}"
-                    )
-                paths.append(p)
-            return paths
-        raise ValueError(
-            "control_path must be a string or list of strings, got "
-            f"{type(control_path).__name__}"
+            f"Prepared transfer plan with {len(controls)} control(s) "
+            f"{[hint.key for hint in hints]}, {total_frames} output frames at "
+            f"{batch.fps} FPS, {num_chunks} chunk(s) of {chunk_frames} frames"
         )
 
     def iter_sequential_requests(
@@ -476,15 +440,17 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         if isinstance(video_path, list):
             video_path = video_path[0] if video_path else None
 
-        control_paths = self._normalize_control_paths(
-            getattr(batch.sampling_params, "control_path", None)
+        transfer_hints = (
+            batch.sampling_params.resolve_transfer_hints()
+            if isinstance(batch.sampling_params, Cosmos3SamplingParams)
+            else []
         )
-        if control_paths:
+        if transfer_hints:
             if image_path is not None:
                 raise ValueError(
                     "Cosmos3 transfer accepts an optional source video, not an image"
                 )
-            self._prepare_transfer_plan(batch, control_paths, video_path)
+            self._prepare_transfer_plan(batch, transfer_hints, video_path)
             return batch
 
         if image_path and video_path:
@@ -722,13 +688,19 @@ class Cosmos3TokenizationStage(PipelineStage):
                 server_args.pipeline_config, "use_system_prompt", False
             )
         fps = batch.fps or 24.0
-        num_frames = batch.extra.get("transfer_plan", {}).get(
-            "chunk_frames", batch.num_frames
+        transfer_plan = batch.extra.get("transfer_plan")
+        num_frames = (
+            transfer_plan["chunk_frames"] if transfer_plan else batch.num_frames
         )
         is_image_gen = batch.data_type == DataType.IMAGE
         system_prompt = (
             COSMOS3_IMAGE_SYSTEM_PROMPT if is_image_gen else COSMOS3_VIDEO_SYSTEM_PROMPT
         )
+        if transfer_plan:
+            # Transfer captions (positive and negative) always carry the Transfer
+            # system prompt, whatever the checkpoint's use_system_prompt says.
+            system_prompt = COSMOS3_TRANSFER_SYSTEM_PROMPT
+            use_system_prompt = True
 
         # Action mode uses a structured JSON caption with neither a system
         # prompt nor the duration suffix.
@@ -760,6 +732,13 @@ class Cosmos3TokenizationStage(PipelineStage):
             suffix = COSMOS3_DURATION_TEMPLATE.format(duration=duration, fps=fps)
             prompt = f"{prompt} {suffix}"
             self.log_info(f"Prompt with duration: '{prompt}'")
+        if transfer_plan and batch.sampling_params.emphasize_control_in_prompt:
+            hints = transfer_plan["hints"]
+            prompt = (
+                [append_control_emphasis(p, hints) for p in prompt]
+                if isinstance(prompt, list)
+                else append_control_emphasis(prompt, hints)
+            )
 
         # Tokenize prompts
         if isinstance(prompt, list) and not isinstance(negative_prompt, list):
@@ -1434,6 +1413,11 @@ class Cosmos3DenoisingStage(PipelineStage):
             )
 
     @staticmethod
+    def _control_cfg_active_at(t: float, interval: tuple[float, float] | None) -> bool:
+        """Control-CFG window, open at both ends as imaginaire4's ``ControlGuidance.active``."""
+        return interval is None or interval[0] < t < interval[1]
+
+    @staticmethod
     def _cfg_active_at(t: float, interval: tuple[float, float] | None) -> bool:
         """Return True iff CFG should be applied at timestep ``t``.
 
@@ -1584,19 +1568,31 @@ class Cosmos3DenoisingStage(PipelineStage):
         batch.extra["control_latents"] = control_latents
         return current_conditional_frames
 
+    @staticmethod
+    def _transfer_chunk_generator(
+        batch: Req, base_generator: torch.Generator | None, chunk_id: int
+    ) -> torch.Generator | None:
+        """Chunk ``k`` draws its noise from ``seed + k``, as imaginaire4 seeds each chunk."""
+        if chunk_id == 0 or batch.seed is None or base_generator is None:
+            return base_generator
+        return torch.Generator(device=base_generator.device).manual_seed(
+            int(batch.seed) + chunk_id
+        )
+
     def _forward_transfer(self, batch: Req, server_args: ServerArgs) -> Req:
         if self.vae is None:
             raise RuntimeError("Cosmos3 Transfer denoising requires the pipeline VAE")
 
         device = batch.latents.device
-        generator = batch.generator
-        if generator is None and batch.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(batch.seed)
+        base_generator = batch.generator
+        if base_generator is None and batch.seed is not None:
+            base_generator = torch.Generator(device=device).manual_seed(batch.seed)
 
         plan = batch.extra["transfer_plan"]
         output_chunks = []
         previous_output = None
         for chunk_id in range(int(plan["num_chunks"])):
+            generator = self._transfer_chunk_generator(batch, base_generator, chunk_id)
             with self.use_declared_component(
                 component_name="vae",
                 module=self.vae,
@@ -1650,6 +1646,15 @@ class Cosmos3DenoisingStage(PipelineStage):
         self._extra_transformer_kwargs = dict(
             batch.extra.get("transformer_extra_kwargs") or {}
         )
+        transfer_plan = batch.extra.get("transfer_plan")
+        if (
+            transfer_plan is not None
+            and len(transfer_plan.get("control_weights", ())) > 1
+        ):
+            # Several controls attend in weighted passes (imaginaire4 multi-control).
+            self._extra_transformer_kwargs["control_weights"] = transfer_plan[
+                "control_weights"
+            ]
         latents = batch.latents
         sound_latents = batch.audio_latents
         action_latents = getattr(batch, "action_latents", None)
@@ -1804,7 +1809,9 @@ class Cosmos3DenoisingStage(PipelineStage):
             control_cfg_active = (
                 control_latents is not None
                 and control_guidance != 1.0
-                and self._cfg_active_at(timestep_values[i], control_guidance_interval)
+                and self._control_cfg_active_at(
+                    timestep_values[i], control_guidance_interval
+                )
             )
 
             if control_cfg_active:
@@ -2423,13 +2430,14 @@ class Cosmos3DenoisingStage(PipelineStage):
         - ``cond_full`` — control clips in (the standard transfer forward)
         - ``cond_nc``   — control clips dropped (``control_latents=None``)
 
-        mixed on the generated span as ``cond = cond_nc + cg*(cond_full -
+        mixed on the generated span as ``cond = cond_nc + eff*(cond_full -
         cond_nc)``. When text CFG is also active a third (uncond, control-in)
         forward composes the text blend ``pred = uncond + g*(cond - uncond)`` on
-        top. Expanding both gives the coefficient-weighted sum reduced by
-        ``_predict_noise_cfg``::
+        top. As in imaginaire4, ``eff = 1 + (cg - 1) / g`` so the text blend does
+        not multiply the control increment again; expanding both gives the
+        coefficient-weighted sum reduced by ``_predict_noise_cfg``::
 
-            pred = g*cg*cond_full + g*(1-cg)*cond_nc + (1-g)*uncond
+            pred = (g+cg-1)*cond_full + (1-cg)*cond_nc + (1-g)*uncond
 
         (with ``g = 1`` collapsing to ``cg*cond_full + (1-cg)*cond_nc``).
 
@@ -2459,8 +2467,13 @@ class Cosmos3DenoisingStage(PipelineStage):
             cond_full["coeff"] = cg
             cond_nc["coeff"] = 1.0 - cg
             return [cond_full, cond_nc]
-        cond_full["coeff"] = g * cg
-        cond_nc["coeff"] = g * (1.0 - cg)
+        if g == 0.0:
+            raise ValueError(
+                "control_guidance != 1.0 cannot be composed with text guidance scale "
+                "0.0: the text-CFG blend would discard every control increment."
+            )
+        cond_full["coeff"] = g + cg - 1.0
+        cond_nc["coeff"] = 1.0 - cg
         uncond = {
             "cache_key": "uncond",
             "text_ids": uncond_text_ids,
@@ -2773,11 +2786,14 @@ class Cosmos3DecodingStage(PipelineStage):
                 audio_sample_rate,
             )
 
+        transfer_plan = batch.extra.get("transfer_plan") or {}
         return OutputBatch(
             output=output,
             audio=audio,
             audio_sample_rate=audio_sample_rate,
             action_pred=action_pred,
+            # Transfer output plays at the source video's rate when one was given.
+            fps=transfer_plan.get("output_fps"),
             metrics=batch.metrics if hasattr(batch, "metrics") else None,
             rollout_trajectory_data=batch.rollout_trajectory_data,
             **action_metadata,

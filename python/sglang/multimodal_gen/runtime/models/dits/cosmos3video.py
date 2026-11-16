@@ -10,6 +10,7 @@ import math
 from collections.abc import Iterable, Iterator, Sequence
 from typing import Any
 
+import msgspec
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -28,6 +29,11 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
     get_tp_world_size,
     sequence_model_parallel_all_gather,
+)
+from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_ring_parallel_world_size,
+    get_ulysses_parallel_rank,
+    get_ulysses_parallel_world_size,
 )
 from sglang.multimodal_gen.runtime.layers.activation import SiluAndMul
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
@@ -56,11 +62,16 @@ from sglang.multimodal_gen.runtime.layers.quantization.modelopt_fp8_step_precisi
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     Qwen3VLTextRotaryEmbedding,
 )
+from sglang.multimodal_gen.runtime.layers.usp import (
+    _usp_input_all_to_all,
+    _usp_output_all_to_all,
+)
 from sglang.multimodal_gen.runtime.layers.visual_embedding import timestep_embedding
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -774,6 +785,45 @@ class Cosmos3CausalAttention(nn.Module):
 # -----------------------------------------------------------------------------
 
 
+class Cosmos3MultiControlLayout(msgspec.Struct, frozen=True):
+    """GEN-token ranges of a transfer pack with several control clips.
+
+    Ranges index the full (unsharded) GEN sequence ``[ctrl_1 | ... | ctrl_N |
+    target]``; ``weights`` are the normalized per-control weights.
+    """
+
+    control_ranges: tuple[tuple[int, int], ...]
+    target_range: tuple[int, int]
+    weights: tuple[float, ...]
+
+
+def build_multi_control_layout(
+    control_token_lens: Sequence[int],
+    target_tokens: int,
+    weights: Sequence[float] | None,
+) -> Cosmos3MultiControlLayout | None:
+    """The multi-control layout, or None for a single control (plain attention)."""
+    if len(control_token_lens) < 2:
+        return None
+    if weights is None:
+        weights = [1.0 / len(control_token_lens)] * len(control_token_lens)
+    if len(weights) != len(control_token_lens):
+        raise ValueError(
+            f"control_weights has {len(weights)} entries for "
+            f"{len(control_token_lens)} control clips."
+        )
+    ranges = []
+    cursor = 0
+    for length in control_token_lens:
+        ranges.append((cursor, cursor + int(length)))
+        cursor += int(length)
+    return Cosmos3MultiControlLayout(
+        control_ranges=tuple(ranges),
+        target_range=(cursor, cursor + int(target_tokens)),
+        weights=tuple(float(w) for w in weights),
+    )
+
+
 class Cosmos3CrossAttention(nn.Module):
     """Generation pathway: cross-attention where visual Q attends to all K/V."""
 
@@ -833,6 +883,7 @@ class Cosmos3CrossAttention(nn.Module):
         use_fused_qk_norm_rope: bool,
         round_norm_before_rope: bool = False,
         multiview_layout: Any | None = None,
+        control_layout: Cosmos3MultiControlLayout | None = None,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -870,6 +921,7 @@ class Cosmos3CrossAttention(nn.Module):
         use_fused_kv_pack = (
             use_fused_qk_norm_rope
             and multiview_layout is None
+            and control_layout is None
             and q.device.type == "cuda"
             and get_sp_world_size() == 1
             and q.dtype == k.dtype == v.dtype == k_und.dtype == v_und.dtype
@@ -921,6 +973,8 @@ class Cosmos3CrossAttention(nn.Module):
             # replaces the dense [UND | GEN] key layout; the subclass applies
             # the Ulysses collectives itself.
             out = self._forward_multiview(q, k, v, k_und, v_und, multiview_layout)
+        elif control_layout is not None:
+            out = self._forward_multi_control(q, k, v, k_und, v_und, control_layout)
         elif not use_fused_kv_pack:
             # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].
             # USPAttention applies the configured backend and SP collectives.
@@ -944,6 +998,73 @@ class Cosmos3CrossAttention(nn.Module):
             "The base Cosmos3 transformer does not support multiview attention "
             "layouts; load the checkpoint through Cosmos3MultiviewTransformer."
         )
+
+    def _forward_multi_control(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_und: torch.Tensor,
+        v_und: torch.Tensor,
+        layout: Cosmos3MultiControlLayout,
+    ) -> torch.Tensor:
+        """imaginaire4 ``multi_control_two_way_attention`` for a single sample.
+
+        One pass per control with K/V ``[text | ctrl_i | target]``: control ``i``
+        keeps its own pass's output, the target the weighted sum of all passes.
+        Under Ulysses the passes run head-sharded on the full sequence.
+        """
+        world_size = get_ulysses_parallel_world_size()
+        if world_size > 1:
+            if get_ring_parallel_world_size() > 1:
+                raise ValueError(
+                    "Cosmos3 multi-control transfer supports Ulysses sequence "
+                    "parallelism only; set ring_degree=1."
+                )
+            # Sequence-sharded [B, S_local, H, D] -> head-sharded [B, S_padded, H/N, D].
+            q = _usp_input_all_to_all(q, head_dim=2)
+            k = _usp_input_all_to_all(k, head_dim=2)
+            v = _usp_input_all_to_all(v, head_dim=2)
+            kv_local = k.shape[2]
+            rank = get_ulysses_parallel_rank()
+            k_und = k_und[:, :, rank * kv_local : (rank + 1) * kv_local]
+            v_und = v_und[:, :, rank * kv_local : (rank + 1) * kv_local]
+        if q.shape[0] != 1:
+            raise ValueError(
+                "Cosmos3 multi-control transfer runs one sample per forward."
+            )
+        attn_metadata = get_forward_context().attn_metadata
+
+        def attend(q_part, k_part, v_part):
+            k_all = torch.cat([k_und, k_part], dim=1)
+            v_all = torch.cat([v_und, v_part], dim=1)
+            return self.attn.attn_impl.forward(q_part, k_all, v_all, attn_metadata)
+
+        t_start, t_end = layout.target_range
+        if t_end > q.shape[1]:
+            raise ValueError(
+                f"Multi-control target range {layout.target_range} exceeds the "
+                f"{q.shape[1]} GEN tokens."
+            )
+        out = torch.zeros_like(q)
+        target_out = None
+        k_target, v_target = k[:, t_start:t_end], v[:, t_start:t_end]
+        for (c_start, c_end), weight in zip(
+            layout.control_ranges, layout.weights, strict=True
+        ):
+            k_pass = torch.cat([k[:, c_start:c_end], k_target], dim=1)
+            v_pass = torch.cat([v[:, c_start:c_end], v_target], dim=1)
+            out[:, c_start:c_end] = attend(q[:, c_start:c_end], k_pass, v_pass)
+            target_pass = attend(q[:, t_start:t_end], k_pass, v_pass)
+            target_out = (
+                weight * target_pass
+                if target_out is None
+                else target_out + weight * target_pass
+            )
+        out[:, t_start:t_end] = target_out
+        if world_size > 1:
+            out = _usp_output_all_to_all(out, head_dim=2)
+        return out
 
 
 # -----------------------------------------------------------------------------
@@ -1075,6 +1196,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         round_norm_before_rope: bool = False,
         residual: torch.Tensor | None = None,
         multiview_layout: Any | None = None,
+        control_layout: Cosmos3MultiControlLayout | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
         # collapses the residual add and RMSNorm into one kernel. The
@@ -1095,6 +1217,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             use_fused_qk_norm_rope,
             round_norm_before_rope,
             multiview_layout=multiview_layout,
+            control_layout=control_layout,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -1577,6 +1700,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         transfer_share_vision_temporal_positions: bool = True,
         temporal_position_period: int | None = None,
         multiview_layout: Any | None = None,
+        control_weights: Sequence[float] | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1620,6 +1744,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             multiview_layout: Opaque attention layout handed to each GEN
                 layer's cross-attention; only the multiview transformer
                 variant accepts it.
+            control_weights: Normalized per-control weights. With two or more
+                control clips the GEN attention runs one pass per control and
+                weights the target's outputs (imaginaire4 multi-control
+                attention); ``None`` weights them uniformly.
 
         Returns:
             [B, C, T, H, W] velocity prediction, or a tuple
@@ -1681,6 +1809,20 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         )
 
         extra_frames = action_frames + sound_frames
+        # Several control clips attend in separate weighted passes; the GEN
+        # stream must then hold only [controls | target].
+        control_layout = build_multi_control_layout(
+            [block.shape[1] for block in hidden_control_blocks],
+            T * Hp * Wp,
+            control_weights,
+        )
+        if control_layout is not None and (
+            extra_frames > 0 or multiview_layout is not None
+        ):
+            raise ValueError(
+                "Cosmos3 multi-control transfer cannot be combined with action, "
+                "sound or multiview tokens."
+            )
         sequence_shard_enabled = self.sp_size > 1
         # When a control clip is present we always assemble the combined GEN
         # stream (control prefix + video [+ action] [+ sound]) instead of the
@@ -1883,6 +2025,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 round_norm_before_rope,
                 residual=residual,
                 multiview_layout=multiview_layout,
+                control_layout=control_layout,
             )
 
         # Collapse the trailing residual carry. RMSNorm and the linear

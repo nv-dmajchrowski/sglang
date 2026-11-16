@@ -10,8 +10,11 @@ so the file extension and decode path agree.
 """
 
 import json
+import math
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
+
+import msgspec
 
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
@@ -20,6 +23,21 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
+# Transfer hint keys in imaginaire4 ``TransferHintKey`` order: controls are packed,
+# and named in the emphasis sentence, in this order whatever the request order.
+COSMOS3_TRANSFER_HINT_KEYS = ("edge", "blur", "depth", "seg", "wsm")
+# Hints imaginaire4 can compute from the input video when no control_path is given.
+COSMOS3_TRANSFER_ON_THE_FLY_HINTS = frozenset({"edge", "blur"})
+COSMOS3_TRANSFER_PRESET_FIELDS = {
+    "edge": (
+        "preset_edge_threshold",
+        ("very_low", "low", "medium", "high", "very_high"),
+    ),
+    "blur": (
+        "preset_blur_strength",
+        ("none", "very_low", "low", "medium", "high", "very_high"),
+    ),
+}
 COSMOS3_EDGE_T2I_GUIDANCE_SCALE = 7.0
 COSMOS3_EDGE_T2V_GUIDANCE_SCALE = 5.0
 COSMOS3_EDGE_T2V_WIDTH = 832
@@ -67,6 +85,77 @@ def _optional_int_list(value: Any) -> list[int] | None:
     return [int(value)]
 
 
+class Cosmos3TransferHint(msgspec.Struct, frozen=True):
+    """One control input of a transfer request.
+
+    ``key`` is None only for the untyped ``control_path`` form; ``control_path``
+    is None when an edge/blur control is computed from the input video.
+    """
+
+    key: str | None
+    control_path: str | None = None
+    weight: float = 1.0
+    preset: str = "medium"
+
+
+def _transfer_weight(value: Any, name: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{name} must be a number, got {value!r}")
+    try:
+        weight = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} must be a number, got {value!r}") from None
+    if not math.isfinite(weight) or weight < 0:
+        raise ValueError(f"{name} must be finite and non-negative, got {value!r}")
+    return weight
+
+
+def parse_transfer_hint_object(key: str, value: Any) -> Cosmos3TransferHint:
+    """One per-hint request object (``edge: {...}``) as imaginaire4 accepts it.
+
+    ``true`` / ``{}`` select the hint with defaults; a string is its
+    ``control_path``; an object may carry ``control_path``, ``weight`` and the
+    hint's preset (``preset_edge_threshold`` / ``preset_blur_strength``).
+    """
+    value = _parse_request_value(value)
+    if value is True:
+        value = {}
+    elif isinstance(value, str):
+        value = {"control_path": value}
+    if not isinstance(value, dict):
+        raise ValueError(
+            f"Cosmos3 transfer hint {key!r} must be an object, a control path or true, "
+            f"got {value!r}."
+        )
+    preset_field, presets = COSMOS3_TRANSFER_PRESET_FIELDS.get(key, (None, ()))
+    allowed = {"control_path", "weight"} | ({preset_field} if preset_field else set())
+    unknown = set(value) - allowed
+    if unknown:
+        raise ValueError(
+            f"Unsupported Cosmos3 transfer hint {key!r} fields {sorted(unknown)}; "
+            f"supported: {sorted(allowed)}."
+        )
+    control_path = value.get("control_path")
+    if control_path is not None and (
+        not isinstance(control_path, str) or not control_path.strip()
+    ):
+        raise ValueError(f"{key}.control_path must be a non-empty string.")
+    weight = value.get("weight")
+    preset = value.get(preset_field) if preset_field else None
+    if preset is None:
+        preset = "medium"
+    elif preset not in presets:
+        raise ValueError(
+            f"{key}.{preset_field} must be one of {list(presets)}, got {preset!r}."
+        )
+    return Cosmos3TransferHint(
+        key=key,
+        control_path=control_path,
+        weight=1.0 if weight is None else _transfer_weight(weight, f"{key}.weight"),
+        preset=str(preset),
+    )
+
+
 @dataclass
 class Cosmos3SamplingParams(SamplingParams):
     """Cosmos3 sampling parameters (T2V defaults; also used for I2V / V2V / T2I).
@@ -77,6 +166,10 @@ class Cosmos3SamplingParams(SamplingParams):
     """
 
     _explicit_fields: ClassVar[set[str] | None] = None
+    # Single-view transfer request lowering (WSM length/fps defaults; otherwise the
+    # output follows the control clip unless the video request sets num_frames or
+    # seconds). Subclasses with their own frame contract opt out.
+    _single_view_transfer: ClassVar[bool] = True
 
     height: int | None = None
     width: int | None = None
@@ -113,11 +206,24 @@ class Cosmos3SamplingParams(SamplingParams):
     # ``proj_in``, so every Cosmos3 checkpoint supports transfer.
     control_path: str | list[str] | None = None
 
-    # Optional hint type(s) parallel to ``control_path`` (one of
-    # ``edge`` / ``blur`` / ``depth`` / ``seg`` / ``wsm``). Used only to apply
-    # tuned per-hint defaults (``guidance`` / ``control_guidance`` / ``shift``)
-    # when exactly one control input is given and the user left those unset.
+    # Hint type(s) parallel to ``control_path`` (``edge`` / ``blur`` / ``depth``
+    # / ``seg`` / ``wsm``); named in the control-emphasis sentence.
     control_hint: str | list[str] | None = None
+    # Optional per-control weights parallel to ``control_path``, normalized to sum 1.
+    control_weight: float | list[float] | None = None
+
+    # The imaginaire4 per-hint request objects, an alternative to the lists
+    # above: ``{"control_path": ..., "weight": ..., "preset_edge_threshold" /
+    # "preset_blur_strength": ...}``, or ``{}`` / ``true``. An edge or blur hint
+    # without ``control_path`` is computed from ``video_path``.
+    edge: Any = None
+    blur: Any = None
+    depth: Any = None
+    seg: Any = None
+    wsm: Any = None
+
+    # Append the control-emphasis sentence to the prompt (default on).
+    emphasize_control_in_prompt: bool | None = None
 
     # Control-CFG scale for transfer. ``1.0`` (default) disables the extra
     # control-dropped forward; values > 1.0 amplify the control map's influence
@@ -132,7 +238,9 @@ class Cosmos3SamplingParams(SamplingParams):
 
     # Long-video transfer controls. Chunks overlap by
     # ``num_conditional_frames`` pixel frames; overlap frames from the previous
-    # decoded chunk are kept clean in the next chunk.
+    # decoded chunk are kept clean in the next chunk. The output follows the
+    # control clip's length, capped by ``max_frames`` (and by ``num_frames``
+    # when the request sets it).
     num_video_frames_per_chunk: int = 93
     num_conditional_frames: int = 1
     num_first_chunk_conditional_frames: int = 0
@@ -141,8 +249,8 @@ class Cosmos3SamplingParams(SamplingParams):
     show_input: bool = False
     share_vision_temporal_positions: bool = True
 
-    # Tuned per-hint defaults applied when exactly one control input is given
-    # and the corresponding field was not set explicitly (mirrors the
+    # Tuned per-hint defaults applied when exactly one typed control input is
+    # given and the corresponding field was not set explicitly (mirrors the
     # cosmos-framework ``_TRANSFER_DEFAULTS`` table). ``shift`` maps to
     # ``flow_shift``. Multi-hint transfer keeps the request's own values.
     _TRANSFER_DEFAULTS: ClassVar[dict[str, dict[str, float | int]]] = {
@@ -224,12 +332,17 @@ class Cosmos3SamplingParams(SamplingParams):
                 "condition_frame_indexes",
                 "condition_frame_indexes_vision",
                 "condition_video_keep",
+                "blur",
                 "control_guidance",
                 "control_guidance_interval",
                 "control_hint",
                 "control_path",
+                "control_weight",
+                "depth",
                 "domain_id",
                 "domain_name",
+                "edge",
+                "emphasize_control_in_prompt",
                 "generate_sound",
                 "guardrails",
                 "max_frames",
@@ -237,10 +350,12 @@ class Cosmos3SamplingParams(SamplingParams):
                 "num_first_chunk_conditional_frames",
                 "num_video_frames_per_chunk",
                 "raw_action_dim",
+                "seg",
                 "share_vision_temporal_positions",
                 "show_control_condition",
                 "show_input",
                 "sound_duration",
+                "wsm",
             }
         )
 
@@ -259,44 +374,129 @@ class Cosmos3SamplingParams(SamplingParams):
         hints = [hint] if isinstance(hint, str) else list(hint)
         hints = [h for h in hints if h]
         for h in hints:
-            if h not in self._TRANSFER_DEFAULTS:
+            if h not in COSMOS3_TRANSFER_HINT_KEYS:
                 raise ValueError(
                     f"Unknown control_hint {h!r}; expected one of "
-                    f"{sorted(self._TRANSFER_DEFAULTS)}"
+                    f"{list(COSMOS3_TRANSFER_HINT_KEYS)}"
                 )
         return hints
 
-    def _apply_transfer_hint_defaults(self) -> None:
+    def _resolve_control_weights(self) -> list[float]:
+        weight = _parse_request_value(self.control_weight)
+        if weight is None:
+            return []
+        weights = list(weight) if isinstance(weight, (list, tuple)) else [weight]
+        return [_transfer_weight(w, "control_weight") for w in weights]
+
+    def resolve_transfer_hints(self) -> list[Cosmos3TransferHint]:
+        """The request's control inputs in ``COSMOS3_TRANSFER_HINT_KEYS`` order.
+
+        Accepts either the per-hint objects (``edge`` ... ``wsm``) or the
+        ``control_path`` / ``control_hint`` / ``control_weight`` lists. Untyped
+        ``control_path`` entries keep their request order with ``key=None``.
+        """
+        objects = {
+            key: getattr(self, key)
+            for key in COSMOS3_TRANSFER_HINT_KEYS
+            if getattr(self, key) is not None
+        }
+        paths = self._resolve_control_paths()
+        hints = self._resolve_control_hints()
+        weights = self._resolve_control_weights()
+        if objects and (paths or hints or weights):
+            raise ValueError(
+                "Cosmos3 transfer takes either the per-hint objects "
+                f"({', '.join(COSMOS3_TRANSFER_HINT_KEYS)}) or control_path/"
+                "control_hint/control_weight, not both."
+            )
+        if objects:
+            return [
+                parse_transfer_hint_object(key, value) for key, value in objects.items()
+            ]
+        if hints and len(hints) != len(paths):
+            raise ValueError(
+                "control_hint must contain exactly one entry per control_path "
+                f"(got {len(hints)} hint(s) for {len(paths)} path(s))"
+            )
+        if weights and len(weights) != len(paths):
+            raise ValueError(
+                "control_weight must contain exactly one entry per control_path "
+                f"(got {len(weights)} weight(s) for {len(paths)} path(s))"
+            )
+        if len(set(hints)) != len(hints):
+            raise ValueError(f"control_hint entries must be unique, got {hints}")
+        resolved = [
+            Cosmos3TransferHint(
+                key=hints[i] if hints else None,
+                control_path=path,
+                weight=weights[i] if weights else 1.0,
+            )
+            for i, path in enumerate(paths)
+        ]
+        if hints:
+            resolved.sort(key=lambda hint: COSMOS3_TRANSFER_HINT_KEYS.index(hint.key))
+        return resolved
+
+    def _apply_transfer_hint_defaults(self, hints: list[Cosmos3TransferHint]) -> bool:
         """Fill tuned per-hint defaults for a single, typed control input.
 
-        Mirrors cosmos-framework: defaults apply only when there is exactly one
-        control input with a known hint type, and only to fields the user did
-        not pass explicitly (tracked via ``_explicit_fields``). Multi-hint
-        transfer keeps the request's own ``guidance`` / ``control_guidance`` /
-        ``flow_shift``.
+        Defaults apply only to fields the request did not pass explicitly; multi-hint
+        and untyped transfer keep the request's own values. Returns whether the
+        hint's default set ``num_frames``.
         """
-        if len(self._resolve_control_paths()) != 1:
-            return
-        hints = self._resolve_control_hints()
-        if len(hints) != 1:
-            return
-        defaults = self._TRANSFER_DEFAULTS.get(hints[0])
-        if defaults is None:
-            return
-        explicit = getattr(self, "_explicit_fields", None) or set()
-        if "control_guidance" not in explicit:
+        if len(hints) != 1 or hints[0].key is None:
+            return False
+        defaults = self._TRANSFER_DEFAULTS[hints[0].key]
+        if not self.is_explicit("control_guidance"):
             self.control_guidance = defaults["control_guidance"]
-        if "guidance_scale" not in explicit:
+        if not self.is_explicit("guidance_scale"):
             self.guidance_scale = defaults["guidance"]
-        if "flow_shift" not in explicit and self.flow_shift is None:
+        if not self.is_explicit("flow_shift") and self.flow_shift is None:
             self.flow_shift = defaults["shift"]
-        for field_name in (
-            "num_frames",
-            "fps",
-            "num_video_frames_per_chunk",
-        ):
-            if field_name in defaults and field_name not in explicit:
+        set_num_frames = False
+        for field_name in ("num_frames", "fps", "num_video_frames_per_chunk"):
+            if field_name in defaults and not self.is_explicit(field_name):
                 setattr(self, field_name, defaults[field_name])
+                set_num_frames = set_num_frames or field_name == "num_frames"
+        return set_num_frames
+
+    def _apply_transfer_defaults(self, hints: list[Cosmos3TransferHint]) -> None:
+        """Validate a transfer request and resolve its emphasis and length.
+
+        Edge/blur controls without a file are computed from ``video_path``. The
+        control-emphasis sentence names every hint, so it defaults on only when
+        all controls are typed. The output follows the control clip, capped by
+        ``max_frames`` and by ``num_frames`` when the request (or the hint's
+        default) sets it.
+        """
+        for hint in hints:
+            if hint.control_path is not None:
+                continue
+            if hint.key not in COSMOS3_TRANSFER_ON_THE_FLY_HINTS:
+                raise ValueError(
+                    f"Missing pre-computed control input for '{hint.key}'. "
+                    "Provide a control_path for it."
+                )
+            if self.video_path is None:
+                raise ValueError(
+                    f"The '{hint.key}' control is computed from video_path; provide "
+                    "video_path or a pre-computed control_path."
+                )
+        if sum(hint.weight for hint in hints) <= 0:
+            raise ValueError(
+                "Cosmos3 transfer control weights must have a positive sum."
+            )
+        typed = all(hint.key is not None for hint in hints)
+        if self.emphasize_control_in_prompt is None:
+            self.emphasize_control_in_prompt = typed
+        elif self.emphasize_control_in_prompt and not typed:
+            raise ValueError(
+                "emphasize_control_in_prompt names the control types; set control_hint "
+                f"({', '.join(COSMOS3_TRANSFER_HINT_KEYS)}) for every control_path."
+            )
+        cap_num_frames = self._apply_transfer_hint_defaults(hints)
+        if cap_num_frames or self.is_explicit("num_frames"):
+            self.max_frames = min(int(self.max_frames), int(self.num_frames))
 
     @classmethod
     def lower_video_request_kwargs(
@@ -340,6 +540,14 @@ class Cosmos3SamplingParams(SamplingParams):
             else:
                 kwargs.pop(name, None)
 
+        for name in (*COSMOS3_TRANSFER_HINT_KEYS, "control_weight"):
+            if name in kwargs:
+                value = _parse_request_value(kwargs[name])
+                if value is None or (isinstance(value, str) and not value.strip()):
+                    kwargs.pop(name)
+                else:
+                    kwargs[name] = value
+
         if "control_guidance" in kwargs:
             kwargs["control_guidance"] = float(
                 _parse_request_value(kwargs["control_guidance"])
@@ -369,6 +577,7 @@ class Cosmos3SamplingParams(SamplingParams):
             "show_control_condition",
             "show_input",
             "share_vision_temporal_positions",
+            "emphasize_control_in_prompt",
         ):
             value = _parse_request_value(kwargs.get(name))
             if value is None or (isinstance(value, str) and not value.strip()):
@@ -401,16 +610,28 @@ class Cosmos3SamplingParams(SamplingParams):
             elif value is not None:
                 kwargs[name] = value
 
+        if not cls._single_view_transfer:
+            return kwargs
         hint = kwargs.get("control_hint")
         paths = kwargs.get("control_path")
         hints = [hint] if isinstance(hint, str) else list(hint or [])
+        hints += [name for name in COSMOS3_TRANSFER_HINT_KEYS if name in kwargs]
         control_paths = [paths] if isinstance(paths, str) else list(paths or [])
-        if len(control_paths) == 1 and hints == ["wsm"]:
+        is_transfer = bool(control_paths or hints)
+        if hints == ["wsm"] and len(control_paths) <= 1:
             defaults = cls._TRANSFER_DEFAULTS["wsm"]
             if request.num_frames is None:
                 kwargs["num_frames"] = defaults["num_frames"]
             if request.fps is None:
                 kwargs["fps"] = defaults["fps"]
+        elif (
+            is_transfer
+            and getattr(request, "num_frames", None) is None
+            and getattr(request, "seconds", None) is None
+        ):
+            # The video API fills num_frames from its default duration; transfer
+            # instead follows the control clip unless the request sets a length.
+            kwargs.pop("num_frames", None)
         return kwargs
 
     def _adjust(self, server_args) -> None:
@@ -456,12 +677,8 @@ class Cosmos3SamplingParams(SamplingParams):
                     "prediction per input; num_outputs_per_prompt must be 1"
                 )
 
-        # Apply transfer per-hint defaults before the base resolves remaining
-        # fields (e.g. flow_shift per mode), so an unset flow_shift can pick up
-        # the hint's tuned shift.
-        self._apply_transfer_hint_defaults()
-        control_paths = self._resolve_control_paths()
-        if control_paths:
+        transfer_hints = self.resolve_transfer_hints()
+        if transfer_hints:
             if pipeline_config.distilled_sigmas is not None:
                 raise ValueError(
                     "Cosmos3 distilled checkpoints do not support transfer inference"
@@ -487,6 +704,7 @@ class Cosmos3SamplingParams(SamplingParams):
                 raise ValueError(
                     "Cosmos3 transfer cannot be combined with sound generation"
                 )
+            self._apply_transfer_defaults(transfer_hints)
         super()._adjust(server_args)
 
         # Policy and inverse dynamics produce actions. Forward dynamics consumes
@@ -536,13 +754,11 @@ class Cosmos3SamplingParams(SamplingParams):
 
     def _validate(self) -> None:
         super()._validate()
-        paths = self._resolve_control_paths()
-        hints = self._resolve_control_hints()
-        if hints and len(hints) != len(paths):
-            raise ValueError(
-                "control_hint must contain exactly one entry per control_path "
-                f"(got {len(hints)} hint(s) for {len(paths)} path(s))"
-            )
+        self.resolve_transfer_hints()
+        if self.emphasize_control_in_prompt is not None and not isinstance(
+            self.emphasize_control_in_prompt, bool
+        ):
+            raise ValueError("emphasize_control_in_prompt must be a boolean or null.")
         if self.control_guidance_interval is not None:
             if len(self.control_guidance_interval) != 2:
                 raise ValueError(

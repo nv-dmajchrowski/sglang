@@ -26,6 +26,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos_dreams import (
 from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
+    Cosmos3TransferHint,
 )
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType
@@ -59,10 +60,13 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader imp
     SchedulerLoader,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.models.dits import cosmos3video as cosmos3_dit
 from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
+    Cosmos3CrossAttention,
     Cosmos3OmniTransformer,
     DomainAwareLinear,
     _can_enable_t1_fused_qk_norm_rope,
+    build_multi_control_layout,
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
@@ -79,13 +83,18 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TokenizationStage,
     _inject_caption_metadata,
     _pad_transfer_frames,
-    _resize_center_crop_uint8_cthw,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
     EMBODIMENT_TO_DOMAIN_ID,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
     is_cosmos_guardrail_available,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_transfer import (
+    COSMOS3_TRANSFER_SYSTEM_PROMPT,
+    blur_control_uint8,
+    edge_control_uint8,
+    resize_center_crop_uint8,
 )
 from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
 from sglang.srt.environ import envs
@@ -1674,28 +1683,24 @@ class TestCosmos3Transfer(unittest.TestCase):
         padded = _pad_transfer_frames(frames, 5)
         self.assertEqual(padded[0, 0, :, 0, 0].tolist(), [0, 1, 2, 2, 1])
 
-    def test_transfer_resize_matches_vllm_omni(self):
-        frames = torch.arange(3 * 2 * 2 * 3, dtype=torch.uint8).reshape(3, 2, 2, 3)
+    def test_transfer_resize_antialiases_and_rounds_crop_like_imaginaire4(self):
+        """Controls are fit like imaginaire4's ``_resize_and_center_crop``.
 
-        actual = _resize_center_crop_uint8_cthw(frames, height=3, width=3)
+        Plain bilinear samples single columns of a 3x downscale (returning
+        one-pixel stripes as 0/255), and a floored crop offset shifts odd
+        margins by a row; both changed the control tokens of 1080p WSM clips.
+        """
+        stripes = torch.zeros(2, 3, 6, 18, dtype=torch.uint8)
+        stripes[..., 1::2] = 255
+        resized = resize_center_crop_uint8(stripes, 2, 6)
+        self.assertEqual(tuple(resized.shape), (2, 3, 2, 6))
+        self.assertEqual(resized.dtype, torch.uint8)
+        self.assertTrue(100 <= resized.min() and resized.max() <= 155)
 
-        resized = torch.nn.functional.interpolate(
-            frames.permute(1, 0, 2, 3).float(),
-            size=(3, 5),
-            mode="bilinear",
-            align_corners=False,
-        )
-        expected = (
-            resized[:, :, :, 1:4]
-            .round()
-            .clamp(0, 255)
-            .to(torch.uint8)
-            .permute(1, 0, 2, 3)
-            .contiguous()
-        )
-        self.assertTrue(torch.equal(actual, expected))
-        self.assertEqual(tuple(actual.shape), (3, 2, 3, 3))
-        self.assertEqual(actual.dtype, torch.uint8)
+        # 7 rows cropped to 4: torchvision rounds the 1.5-row offset to 2.
+        rows = torch.arange(0, 70, 10, dtype=torch.uint8).reshape(1, 1, 7, 1)
+        cropped = resize_center_crop_uint8(rows.expand(1, 3, 7, 4).contiguous(), 4, 4)
+        self.assertEqual(cropped[0, 0, :, 0].tolist(), [20, 30, 40, 50])
 
     def test_transfer_chunks_stitch_without_duplicate_overlap(self):
         class Scheduler:
@@ -1746,10 +1751,22 @@ class TestCosmos3Transfer(unittest.TestCase):
             )
         )
         self.assertEqual(stage.scheduler.calls, 2)
-        for call in stage._prepare_transfer_chunk.call_args_list:
-            self.assertIs(call.args[3], generator)
-        for call in stage._denoise_once.call_args_list:
-            self.assertIs(call.kwargs["generator"], generator)
+        # imaginaire4 seeds chunk k with seed + k: chunk 0 keeps the request
+        # generator, chunk 1 draws from a fresh seed-8 generator.
+        prepare_gens = [c.args[3] for c in stage._prepare_transfer_chunk.call_args_list]
+        denoise_gens = [
+            c.kwargs["generator"] for c in stage._denoise_once.call_args_list
+        ]
+        self.assertIs(prepare_gens[0], generator)
+        self.assertEqual(prepare_gens, denoise_gens)
+        self.assertIsNot(prepare_gens[1], generator)
+        expected = torch.Generator(device="cpu").manual_seed(8)
+        self.assertTrue(
+            torch.equal(
+                torch.randn(4, generator=prepare_gens[1]),
+                torch.randn(4, generator=expected),
+            )
+        )
 
     def test_transfer_display_composes_input_controls_and_output(self):
         output = torch.full((1, 3, 2, 1, 2), 0.5)
@@ -1823,10 +1840,16 @@ class TestCosmos3Transfer(unittest.TestCase):
         out = _run(text_g=1.0, control_g=2.0)
         self.assertTrue(torch.allclose(out, torch.full((1,), 30.0)))
 
-        # control-CFG + text CFG (g=3): g*cg*cond_full + g*(1-cg)*cond_nc
-        #   + (1-g)*uncond = 6*20 + (-3)*10 + (-2)*2 = 86
+        # control-CFG + text CFG (g=3), imaginaire4's executor: the no-control mix
+        # uses eff = 1 + (cg-1)/g before the text blend, so the control increment
+        # is (cg-1)*(full-nc), not g*(cg-1)*(full-nc):
+        #   (g+cg-1)*cond_full + (1-cg)*cond_nc + (1-g)*uncond
+        #   = 4*20 + (-1)*10 + (-2)*2 = 66
         out2 = _run(text_g=3.0, control_g=2.0)
-        self.assertTrue(torch.allclose(out2, torch.full((1,), 86.0)))
+        self.assertTrue(torch.allclose(out2, torch.full((1,), 66.0)))
+
+        with self.assertRaisesRegex(ValueError, "text guidance scale 0.0"):
+            _run(text_g=0.0, control_g=2.0)
 
     def test_text_cfg_batched_single_gpu(self):
         """Single-GPU text CFG batches both branches into one bs=2 forward."""
@@ -1926,7 +1949,7 @@ class TestCosmos3Transfer(unittest.TestCase):
             sent.clear()
             with mock.patch(target, side_effect=fake_gather(2)):
                 out = run(rank, 2)
-            self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+            self.assertTrue(torch.allclose(out, torch.full((1,), 66.0)))
         self.assertEqual(seen[0], ["cond", "uncond"])
         self.assertEqual(seen[1], ["cond_nc"])
         self.assertTrue(torch.equal(sent[1], torch.zeros(1)))
@@ -1937,76 +1960,382 @@ class TestCosmos3Transfer(unittest.TestCase):
             sent.clear()
             with mock.patch(target, side_effect=fake_gather(4)):
                 out = run(rank, 4)
-            self.assertTrue(torch.allclose(out, torch.full((1,), 86.0)))
+            self.assertTrue(torch.allclose(out, torch.full((1,), 66.0)))
         self.assertEqual(seen[0], ["cond"])
         self.assertEqual(seen[1], ["cond_nc"])
         self.assertEqual(seen[2], ["uncond"])
         self.assertEqual(seen[3], [])
         self.assertTrue(torch.equal(sent[0], torch.zeros(1)))
 
+    @staticmethod
+    def _transfer_params(explicit=(), **kwargs):
+        sp = Cosmos3SamplingParams(prompt="t", **kwargs)
+        sp._explicit_fields = {"prompt", *kwargs, *explicit}
+        return sp
+
     def test_single_hint_defaults_applied(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t", control_path="edge.mp4", control_hint="edge"
-        )
-        sp._explicit_fields = {"prompt", "control_path", "control_hint"}
-        sp._apply_transfer_hint_defaults()
+        sp = self._transfer_params(control_path="edge.mp4", control_hint="edge")
+        sp._apply_transfer_hint_defaults(sp.resolve_transfer_hints())
         self.assertEqual(sp.control_guidance, 1.5)
         self.assertEqual(sp.guidance_scale, 3.0)
         self.assertEqual(sp.flow_shift, 10.0)
 
     def test_wsm_uses_transfer_spec_defaults(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t", control_path="wsm.mp4", control_hint="wsm"
-        )
-        sp._explicit_fields = {"prompt", "control_path", "control_hint"}
-        sp._apply_transfer_hint_defaults()
-        self.assertEqual(sp.guidance_scale, 1.0)
-        self.assertEqual(sp.control_guidance, 3.0)
-        self.assertEqual(sp.flow_shift, 10.0)
-        self.assertEqual(sp.num_frames, 101)
-        self.assertEqual(sp.fps, 10)
-        self.assertEqual(sp.num_video_frames_per_chunk, 101)
+        for kwargs in (
+            dict(control_path="wsm.mp4", control_hint="wsm"),
+            dict(wsm={"control_path": "wsm.mp4"}),
+        ):
+            sp = self._transfer_params(**kwargs)
+            sp._apply_transfer_hint_defaults(sp.resolve_transfer_hints())
+            self.assertEqual(sp.guidance_scale, 1.0)
+            self.assertEqual(sp.control_guidance, 3.0)
+            self.assertEqual(sp.flow_shift, 10.0)
+            self.assertEqual(sp.num_frames, 101)
+            self.assertEqual(sp.fps, 10)
+            self.assertEqual(sp.num_video_frames_per_chunk, 101)
 
-        lowered = Cosmos3SamplingParams.lower_video_request_kwargs(
-            types.SimpleNamespace(num_frames=None, fps=None),
-            {
-                "control_path": "wsm.mp4",
-                "control_hint": "wsm",
-                "num_frames": 121,
-                "fps": 24,
-            },
-        )
-        self.assertEqual(lowered["num_frames"], 101)
-        self.assertEqual(lowered["fps"], 10)
+        for extra in (
+            {"control_path": "wsm.mp4", "control_hint": "wsm"},
+            {"wsm": '{"control_path": "wsm.mp4"}'},
+        ):
+            lowered = Cosmos3SamplingParams.lower_video_request_kwargs(
+                types.SimpleNamespace(num_frames=None, fps=None),
+                {"num_frames": 121, "fps": 24, **extra},
+            )
+            self.assertEqual(lowered["num_frames"], 101)
+            self.assertEqual(lowered["fps"], 10)
 
     def test_explicit_value_overrides_hint_default(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t",
-            control_path="seg.mp4",
-            control_hint="seg",
-            control_guidance=4.2,
+        sp = self._transfer_params(
+            control_path="seg.mp4", control_hint="seg", control_guidance=4.2
         )
-        sp._explicit_fields = {"control_path", "control_hint", "control_guidance"}
-        sp._apply_transfer_hint_defaults()
+        sp._apply_transfer_hint_defaults(sp.resolve_transfer_hints())
         self.assertEqual(sp.control_guidance, 4.2)
 
     def test_multi_hint_defaults_not_applied(self):
-        sp = Cosmos3SamplingParams(
-            prompt="t",
-            control_path=["edge.mp4", "depth.mp4"],
-            control_hint=["edge", "depth"],
+        sp = self._transfer_params(
+            control_path=["edge.mp4", "depth.mp4"], control_hint=["edge", "depth"]
         )
         base_guidance = sp.guidance_scale
-        sp._explicit_fields = {"control_path", "control_hint"}
-        sp._apply_transfer_hint_defaults()
+        sp._apply_transfer_hint_defaults(sp.resolve_transfer_hints())
         self.assertEqual(sp.control_guidance, 1.0)
         self.assertEqual(sp.guidance_scale, base_guidance)
 
-    def test_unknown_hint_rejected(self):
-        with self.assertRaises(ValueError):
-            Cosmos3SamplingParams(
-                prompt="t", control_path="x.mp4", control_hint="bogus"
+    def test_transfer_emphasis_and_length_defaults(self):
+        """The emphasis names every hint, so it defaults on only for typed controls;
+        num_frames caps the control-length output only when set by the request or
+        by the WSM hint default."""
+        sp = self._transfer_params(control_path="e.mp4", control_hint="edge")
+        sp._apply_transfer_defaults(sp.resolve_transfer_hints())
+        self.assertIs(sp.emphasize_control_in_prompt, True)
+        self.assertEqual(sp.max_frames, 5000)
+
+        sp = self._transfer_params(control_path="w.mp4", control_hint="wsm")
+        sp._apply_transfer_defaults(sp.resolve_transfer_hints())
+        self.assertEqual(sp.max_frames, 101)
+
+        sp = self._transfer_params(
+            control_path="e.mp4",
+            control_hint="edge",
+            emphasize_control_in_prompt=False,
+            num_frames=121,
+        )
+        sp._apply_transfer_defaults(sp.resolve_transfer_hints())
+        self.assertIs(sp.emphasize_control_in_prompt, False)
+        self.assertEqual(sp.max_frames, 121)
+
+        sp = self._transfer_params(control_path="a.mp4")
+        sp._apply_transfer_defaults(sp.resolve_transfer_hints())
+        self.assertIs(sp.emphasize_control_in_prompt, False)
+        sp = self._transfer_params(
+            control_path="a.mp4", emphasize_control_in_prompt=True
+        )
+        with self.assertRaisesRegex(ValueError, "names the control types"):
+            sp._apply_transfer_defaults(sp.resolve_transfer_hints())
+
+    def test_transfer_hints_resolve_in_imaginaire4_order(self):
+        """Controls pack (and the emphasis names them) in TransferHintKey order."""
+        sp = self._transfer_params(
+            control_path=["d.mp4", "e.mp4"],
+            control_hint=["depth", "edge"],
+            control_weight=[3.0, 1.0],
+        )
+        self.assertEqual(
+            sp.resolve_transfer_hints(),
+            [
+                Cosmos3TransferHint(key="edge", control_path="e.mp4", weight=1.0),
+                Cosmos3TransferHint(key="depth", control_path="d.mp4", weight=3.0),
+            ],
+        )
+        sp = self._transfer_params(
+            wsm={"control_path": "w.mp4", "weight": 2},
+            edge={"preset_edge_threshold": "high"},
+        )
+        self.assertEqual(
+            sp.resolve_transfer_hints(),
+            [
+                Cosmos3TransferHint(key="edge", preset="high"),
+                Cosmos3TransferHint(key="wsm", control_path="w.mp4", weight=2.0),
+            ],
+        )
+
+    def test_transfer_request_contract_refusals(self):
+        bad = [
+            dict(control_path="x.mp4", control_hint="bogus"),
+            dict(control_path=["a.mp4", "b.mp4"], control_hint=["edge", "edge"]),
+            dict(control_path="a.mp4", control_hint="edge", control_weight=[1, 2]),
+            dict(control_path="a.mp4", control_hint="edge", wsm={}),
+            dict(edge={"preset_edge_threshold": "extreme"}),
+            dict(blur={"preset_edge_threshold": "low"}),
+            dict(depth={"weight": -1}),
+        ]
+        for kwargs in bad:
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                Cosmos3SamplingParams(prompt="t", **kwargs)
+
+        # Only edge/blur are computed on the fly, and only from video_path.
+        for kwargs, message in (
+            (dict(depth={}), "Missing pre-computed control input for 'depth'"),
+            (dict(edge={}), "computed from video_path"),
+        ):
+            sp = self._transfer_params(**kwargs)
+            with (
+                self.subTest(kwargs=kwargs),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                sp._apply_transfer_defaults(sp.resolve_transfer_hints())
+        sp = self._transfer_params(edge={}, video_path="in.mp4")
+        sp._apply_transfer_defaults(sp.resolve_transfer_hints())
+
+    def test_video_request_length_follows_control_unless_set(self):
+        kwargs = {"num_frames": 96, "fps": 24, "depth": '{"control_path": "d.mp4"}'}
+        request = types.SimpleNamespace(num_frames=None, seconds=None, model_extra={})
+        lowered = Cosmos3SamplingParams.lower_video_request_kwargs(
+            request, dict(kwargs)
+        )
+        self.assertNotIn("num_frames", lowered)
+        self.assertEqual(lowered["depth"], {"control_path": "d.mp4"})
+        request = types.SimpleNamespace(num_frames=96, seconds=None, model_extra={})
+        lowered = Cosmos3SamplingParams.lower_video_request_kwargs(
+            request, dict(kwargs)
+        )
+        self.assertEqual(lowered["num_frames"], 96)
+
+    def test_prepare_transfer_plan_follows_control_length_and_source_fps(self):
+        """Output length is the first control's (num_frames does not cap it), the
+        source video sets the output fps, and an edge hint without a file is
+        computed from the resized source."""
+        source = torch.randint(0, 256, (3, 9, 16, 32), dtype=torch.uint8)
+        depth = torch.randint(0, 256, (3, 7, 16, 32), dtype=torch.uint8)
+        media = {"in.mp4": (source, 29.97), "depth.mp4": (depth, 30.0)}
+        batch = types.SimpleNamespace(
+            height=16,
+            width=32,
+            fps=24,
+            num_frames=81,
+            extra={},
+            sampling_params=types.SimpleNamespace(
+                max_frames=5000,
+                num_video_frames_per_chunk=5,
+                num_conditional_frames=1,
+                num_first_chunk_conditional_frames=0,
+            ),
+        )
+        hints = [
+            Cosmos3TransferHint(key="edge", weight=1.0),
+            Cosmos3TransferHint(key="depth", control_path="depth.mp4", weight=3.0),
+        ]
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3.read_transfer_media_uint8",
+            side_effect=lambda path, **_kw: media[path],
+        ):
+            Cosmos3ImagePreprocessStage()._prepare_transfer_plan(batch, hints, "in.mp4")
+        plan = batch.extra["transfer_plan"]
+        self.assertEqual(plan["total_frames"], 9)
+        self.assertEqual(batch.num_frames, 9)
+        self.assertEqual((batch.fps, plan["output_fps"]), (30, 30))
+        self.assertEqual(plan["hints"], ["edge", "depth"])
+        self.assertEqual(plan["control_weights"], [0.25, 0.75])
+        controls = batch.extra["preprocessed_control"]
+        self.assertTrue(
+            torch.equal(controls[0][0, :, :9], edge_control_uint8(source, "medium"))
+        )
+        # The shorter depth clip is reflect-padded to the output length.
+        self.assertTrue(torch.equal(controls[1][0, :, :7], depth))
+        self.assertTrue(torch.equal(controls[1][0, :, 7:9], depth[:, [6, 5]]))
+
+    def test_transfer_prompt_has_system_prompt_and_emphasis(self):
+        """Both captions use the Transfer system prompt; only the positive one ends
+        with the emphasis sentence naming the hints in order."""
+        conversations = []
+
+        class Tokenizer:
+            pad_token_id = 0
+            eos_token_id = 1
+
+            def convert_tokens_to_ids(self, token):
+                return 2
+
+            def apply_chat_template(self, conversation, **kwargs):
+                conversations.append(conversation)
+                return [5, 6, 7]
+
+        stage = Cosmos3TokenizationStage(Tokenizer())
+        batch = types.SimpleNamespace(
+            prompt="A road.",
+            negative_prompt="",
+            max_sequence_length=512,
+            use_duration_template=None,
+            use_system_prompt=None,
+            fps=30,
+            num_frames=41,
+            height=480,
+            width=832,
+            data_type=DataType.VIDEO,
+            sampling_params=types.SimpleNamespace(
+                action_mode=None, emphasize_control_in_prompt=True
+            ),
+            extra={"transfer_plan": {"chunk_frames": 93, "hints": ["edge", "wsm"]}},
+        )
+        server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                use_duration_template=True,
+                use_system_prompt=False,
             )
+        )
+        with mock.patch(
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ):
+            stage.forward(batch, server_args)
+        positive, negative = conversations
+        self.assertEqual(
+            positive[0], {"role": "system", "content": COSMOS3_TRANSFER_SYSTEM_PROMPT}
+        )
+        self.assertEqual(negative[0], positive[0])
+        # imaginaire4 control_requests.append_control_emphasis, verbatim.
+        self.assertEqual(
+            positive[1]["content"],
+            "A road. The video is 3.1 seconds long and is of 30 FPS. Follow the edge, "
+            "wsm control video precisely: shape, contour, silhouette, position, and "
+            "motion of every visible structure must align with the edge, wsm signal at "
+            "every frame.",
+        )
+        self.assertEqual(negative[1]["content"], "")
+
+    def test_multi_control_attention_weights_independent_control_passes(self):
+        """imaginaire4 multi_control_two_way_attention: control i attends to
+        [text | ctrl_i | target] only, and the target's output is the weighted
+        sum of those per-control passes (not one joint softmax over all controls)."""
+        self.assertIsNone(build_multi_control_layout([4], 6, None))
+        layout = build_multi_control_layout([3, 2], 4, [0.25, 0.75])
+        self.assertEqual(layout.control_ranges, ((0, 3), (3, 5)))
+        self.assertEqual(layout.target_range, (5, 9))
+        with self.assertRaisesRegex(ValueError, "control_weights"):
+            build_multi_control_layout([3, 2], 4, [1.0])
+
+        def sdpa(q, k, v, _metadata):
+            k = k.repeat_interleave(q.shape[2] // k.shape[2], dim=2)
+            v = v.repeat_interleave(q.shape[2] // v.shape[2], dim=2)
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+            )
+            return out.transpose(1, 2)
+
+        attention = types.SimpleNamespace(
+            attn=types.SimpleNamespace(attn_impl=types.SimpleNamespace(forward=sdpa))
+        )
+        gen = torch.Generator().manual_seed(0)
+        q, k, v = (
+            torch.randn(1, 9, 4, 8, generator=gen, dtype=torch.float64)
+            for _ in range(3)
+        )
+        k_und, v_und = (
+            torch.randn(1, 3, 2, 8, generator=gen, dtype=torch.float64)
+            for _ in range(2)
+        )
+        k, v = k[:, :, :2], v[:, :, :2]
+
+        def plain(rows, keys):
+            return sdpa(
+                q[:, rows],
+                torch.cat([k_und, k[:, keys]], 1),
+                torch.cat([v_und, v[:, keys]], 1),
+                None,
+            )
+
+        target = list(range(5, 9))
+        pass1 = plain(target, [0, 1, 2, *target])
+        pass2 = plain(target, [3, 4, *target])
+        with (
+            mock.patch.object(
+                cosmos3_dit,
+                "get_forward_context",
+                return_value=types.SimpleNamespace(attn_metadata=None),
+            ),
+            mock.patch.object(
+                cosmos3_dit, "get_ulysses_parallel_world_size", return_value=1
+            ),
+        ):
+            out = Cosmos3CrossAttention._forward_multi_control(
+                attention, q, k, v, k_und, v_und, layout
+            )
+        self.assertTrue(
+            torch.allclose(out[:, 0:3], plain([0, 1, 2], [0, 1, 2, *target]))
+        )
+        self.assertTrue(torch.allclose(out[:, 3:5], plain([3, 4], [3, 4, *target])))
+        self.assertTrue(torch.allclose(out[:, 5:9], 0.25 * pass1 + 0.75 * pass2))
+
+    def test_on_the_fly_controls_follow_imaginaire4_presets(self):
+        """Edge/blur presets are imaginaire4's AddControlInputEdge/Blur inference values."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages import (
+            cosmos3_transfer,
+        )
+
+        self.assertEqual(
+            cosmos3_transfer.COSMOS3_EDGE_THRESHOLDS,
+            {
+                "very_low": (20, 50),
+                "low": (50, 100),
+                "medium": (100, 200),
+                "high": (200, 300),
+                "very_high": (300, 400),
+            },
+        )
+        self.assertEqual(
+            (
+                cosmos3_transfer.COSMOS3_BLUR_PRE_DOWNSCALE,
+                cosmos3_transfer.COSMOS3_BLUR_DOWNUP,
+            ),
+            (
+                {
+                    "none": 1,
+                    "very_low": 1,
+                    "low": 4,
+                    "medium": 2,
+                    "high": 1,
+                    "very_high": 4,
+                },
+                {
+                    "none": 1,
+                    "very_low": 4,
+                    "low": 4,
+                    "medium": 10,
+                    "high": 16,
+                    "very_high": 16,
+                },
+            ),
+        )
+        frames = torch.randint(0, 256, (3, 2, 40, 64), dtype=torch.uint8)
+        edge = edge_control_uint8(frames, "medium")
+        self.assertEqual((edge.shape, edge.dtype), (frames.shape, torch.uint8))
+        self.assertTrue(torch.equal(edge[0], edge[2]))
+        self.assertTrue(set(edge.unique().tolist()) <= {0, 255})
+        self.assertTrue(torch.equal(blur_control_uint8(frames, "none"), frames))
+        blurred = blur_control_uint8(frames, "medium")
+        self.assertEqual((blurred.shape, blurred.dtype), (frames.shape, torch.uint8))
 
 
 class TestCosmos3DomainAwareLinear(unittest.TestCase):

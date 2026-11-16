@@ -86,7 +86,7 @@ class CosmosDreamsSamplingParams(Cosmos3SamplingParams):
             raise ValueError(
                 "Cosmos-Dreams conditions on a single image; video_path is not supported."
             )
-        if self._resolve_control_paths():
+        if self.resolve_transfer_hints():
             raise ValueError(
                 "Cosmos-Dreams does not support transfer (control_path) inference."
             )
