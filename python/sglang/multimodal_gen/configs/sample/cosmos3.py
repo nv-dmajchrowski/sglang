@@ -29,6 +29,18 @@ COSMOS3_EDGE_T2I_SIZE = 640
 # other sizes.
 COSMOS3_SIZE_MULTIPLE = 16
 
+# Native ``defaults/wam/sample_args.json`` (identical for forward/inverse
+# dynamics): applied to ``action_mode="wam"`` fields the request left unset.
+# ``resolution="256"`` with ``aspect_ratio="16,9"`` is the 320x192 canvas.
+COSMOS3_WAM_DEFAULTS: dict[str, Any] = {
+    "guidance_scale": 1.0,
+    "num_inference_steps": 30,
+    "num_frames": 17,
+    "fps": 24,
+    "width": 320,
+    "height": 192,
+}
+
 # Image generation applies guidance only over a high-noise window; guiding the
 # low-noise steps degrades sample quality (Kynkaeaenniemi et al. 2024). Video
 # modes guide at every step.
@@ -172,7 +184,10 @@ class Cosmos3SamplingParams(SamplingParams):
     )
 
     # Action modality (requires action_gen=True in the model checkpoint)
-    # action_mode: "forward_dynamics" | "policy" | "inverse_dynamics"
+    # action_mode: "forward_dynamics" | "policy" | "inverse_dynamics" | "wam".
+    # "wam" denoises the future video and the actions jointly from the first
+    # frame and returns both; "policy" runs the same sequence and returns only
+    # the actions.
     action_mode: str | None = None
     domain_id: int | None = None
     domain_name: str | None = None
@@ -188,6 +203,12 @@ class Cosmos3SamplingParams(SamplingParams):
     # into physical units with ``action_normalization``.
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
+    # Native ``format_prompt_as_json`` for action modes: the structured JSON
+    # caption (default) or the prompt as given, for plain-caption recipes.
+    format_prompt_as_json: bool = True
+    # Set by /v1/actions/generations: return the action payload (for "wam" plus
+    # the decoded frames) instead of a media file.
+    return_action_payload: bool = False
 
     def is_explicit(self, name: str) -> bool:
         return self._explicit_fields is not None and name in self._explicit_fields
@@ -230,6 +251,7 @@ class Cosmos3SamplingParams(SamplingParams):
                 "control_path",
                 "domain_id",
                 "domain_name",
+                "format_prompt_as_json",
                 "generate_sound",
                 "guardrails",
                 "max_frames",
@@ -369,6 +391,7 @@ class Cosmos3SamplingParams(SamplingParams):
             "show_control_condition",
             "show_input",
             "share_vision_temporal_positions",
+            "format_prompt_as_json",
         ):
             value = _parse_request_value(kwargs.get(name))
             if value is None or (isinstance(value, str) and not value.strip()):
@@ -411,6 +434,14 @@ class Cosmos3SamplingParams(SamplingParams):
                 kwargs["num_frames"] = defaults["num_frames"]
             if request.fps is None:
                 kwargs["fps"] = defaults["fps"]
+        action_mode = kwargs.get("action_mode")
+        if isinstance(action_mode, str) and action_mode.strip().lower() == "wam":
+            # The video API always derives num_frames/fps from its own defaults;
+            # take the native wam clip instead unless the request set them.
+            if request.fps is None:
+                kwargs["fps"] = COSMOS3_WAM_DEFAULTS["fps"]
+            if request.num_frames is None and "seconds" not in request.model_fields_set:
+                kwargs["num_frames"] = COSMOS3_WAM_DEFAULTS["num_frames"]
         return kwargs
 
     def _adjust(self, server_args) -> None:
@@ -444,17 +475,28 @@ class Cosmos3SamplingParams(SamplingParams):
                 "policy",
                 "forward_dynamics",
                 "inverse_dynamics",
+                "wam",
             ):
                 raise ValueError(
                     f"Unsupported action_mode={self.action_mode!r}; expected "
-                    "'policy', 'forward_dynamics', or 'inverse_dynamics'."
+                    "'policy', 'forward_dynamics', 'inverse_dynamics', or 'wam'."
                 )
-            action_output = self.action_mode != "forward_dynamics"
-            if action_output and self.num_outputs_per_prompt > 1:
+            action_output = self._returns_action_payload()
+            if (
+                action_output or self.action_mode == "wam"
+            ) and self.num_outputs_per_prompt > 1:
                 raise ValueError(
-                    "Cosmos3 policy and inverse-dynamics requests return one "
+                    "Cosmos3 policy, inverse-dynamics and wam requests return one "
                     "prediction per input; num_outputs_per_prompt must be 1"
                 )
+            if self.action_mode == "wam":
+                if self.image_path is None or self.video_path is not None:
+                    raise ValueError(
+                        "action_mode='wam' predicts video and actions from one "
+                        "observation image; pass the image (image_path / "
+                        "input_reference) and no video"
+                    )
+                self._apply_wam_defaults(is_distilled=distilled_sigmas is not None)
 
         # Apply transfer per-hint defaults before the base resolves remaining
         # fields (e.g. flow_shift per mode), so an unset flow_shift can pick up
@@ -490,7 +532,9 @@ class Cosmos3SamplingParams(SamplingParams):
         super()._adjust(server_args)
 
         # Policy and inverse dynamics produce actions. Forward dynamics consumes
-        # actions to produce video and therefore remains a visual request.
+        # actions to produce video and therefore remains a visual request, as
+        # does wam (video + actions) unless the action endpoint asked for the
+        # action payload.
         if action_output:
             self.data_type = DataType.ACTION
             self.save_output = False
@@ -566,6 +610,31 @@ class Cosmos3SamplingParams(SamplingParams):
         if self.max_frames <= 0:
             raise ValueError("max_frames must be positive")
 
+    def _returns_action_payload(self) -> bool:
+        """Whether the request returns the action payload instead of a media file."""
+        if self.action_mode in ("policy", "inverse_dynamics"):
+            return True
+        return self.action_mode == "wam" and bool(self.return_action_payload)
+
+    def _apply_wam_defaults(self, is_distilled: bool) -> None:
+        """Fill the wam fields the user left unset with the native defaults.
+
+        Only user-facing construction tracks explicit fields; a directly
+        constructed request (the action endpoint, tests) owns every field.
+        """
+        explicit = self._explicit_fields
+        if explicit is None:
+            return
+        for name, value in COSMOS3_WAM_DEFAULTS.items():
+            if name in ("width", "height") or name in explicit:
+                continue
+            if name == "num_inference_steps" and is_distilled:
+                continue
+            setattr(self, name, value)
+        if not explicit & {"width", "height", "size"}:
+            self.width = COSMOS3_WAM_DEFAULTS["width"]
+            self.height = COSMOS3_WAM_DEFAULTS["height"]
+
     def _guidance_is_explicit(self) -> bool:
         explicit = getattr(self, "_explicit_fields", None)
         return explicit is not None and "guidance_scale" in explicit
@@ -604,7 +673,7 @@ class Cosmos3SamplingParams(SamplingParams):
     def _set_output_file_name(self) -> None:
         # Action outputs never need a visual filename. This also avoids hashing
         # in-memory observation images while base visual adjustment is running.
-        if self.action_mode in ("policy", "inverse_dynamics"):
+        if self.action_mode is not None and self._returns_action_payload():
             return
         # The pipeline config's ``task_type=TI2V`` drives ``data_type`` to
         # VIDEO, but a single-frame request is a T2I and must pick the IMAGE

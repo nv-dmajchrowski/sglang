@@ -13,11 +13,21 @@ import torch
 ACTION_MODE_POLICY = "policy"
 ACTION_MODE_FORWARD_DYNAMICS = "forward_dynamics"
 ACTION_MODE_INVERSE_DYNAMICS = "inverse_dynamics"
+# Joint video + action prediction (native ``model_mode="wam"``): the first frame
+# is clean, the future video and every action row are denoised together, and
+# both are returned. ``policy`` runs the same sequence and returns only the
+# actions (the native policy servers run ``wam`` and skip the video decode).
+ACTION_MODE_WAM = "wam"
 ACTION_MODES = {
     ACTION_MODE_POLICY,
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
+    ACTION_MODE_WAM,
 }
+# Modes conditioned on one observation image whose actions are all generated.
+ACTION_IMAGE_MODES = {ACTION_MODE_POLICY, ACTION_MODE_WAM}
+# Modes whose only output is the action chunk (no VAE decode).
+ACTION_ONLY_OUTPUT_MODES = {ACTION_MODE_POLICY, ACTION_MODE_INVERSE_DYNAMICS}
 
 EMBODIMENT_TO_DOMAIN_ID: dict[str, int] = {
     "no_action": 0,
@@ -88,11 +98,80 @@ VIDEO_RES_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
     },
 }
 
+# Every native canvas size (all resolution tiers, native order): the action
+# caption labels a canvas by its table aspect key, so sizes whose reduced ratio
+# differs from the key (e.g. 960x544 -> "16,9", not "30,17") need the entry.
+ASPECT_RATIO_SIZE_INFO: dict[str, dict[str, tuple[int, int]]] = {
+    "256": VIDEO_RES_SIZE_INFO["256"],
+    "272": {
+        "1,1": (352, 352),
+        "4,3": (416, 304),
+        "3,4": (304, 416),
+        "16,9": (480, 272),
+        "9,16": (272, 480),
+    },
+    "544": {
+        "1,1": (720, 720),
+        "4,3": (832, 624),
+        "3,4": (624, 832),
+        "16,9": (960, 544),
+        "9,16": (544, 960),
+    },
+    "480": {**VIDEO_RES_SIZE_INFO["480"], "2,3": (512, 768)},
+    "704": VIDEO_RES_SIZE_INFO["704"],
+    "720": VIDEO_RES_SIZE_INFO["720"],
+    "768": {
+        "1,1": (1024, 1024),
+        "4,3": (1184, 880),
+        "3,4": (880, 1184),
+        "16,9": (1360, 768),
+        "9,16": (768, 1360),
+    },
+    "1080": {
+        "1,1": (1440, 1440),
+        "4,3": (1664, 1248),
+        "3,4": (1248, 1664),
+        "16,9": (1920, 1088),
+        "9,16": (1088, 1920),
+    },
+    "1280": {
+        "1,1": (1712, 1712),
+        "4,3": (1968, 1472),
+        "3,4": (1472, 1968),
+        "16,9": (2272, 1280),
+        "9,16": (1280, 2272),
+    },
+    "2048": {
+        "1,1": (2728, 2728),
+        "4,3": (3160, 2368),
+        "3,4": (2368, 3160),
+        "16,9": (3640, 2048),
+        "9,16": (2048, 3640),
+    },
+    "gt_2048": {
+        "1,1": (5464, 5464),
+        "4,3": (6304, 4728),
+        "3,4": (4728, 6304),
+        "16,9": (7280, 4096),
+        "9,16": (4096, 7280),
+    },
+    "1440": {
+        "1,1": (1920, 1920),
+        "4,3": (2208, 1664),
+        "3,4": (1664, 2208),
+        "16,9": (2560, 1440),
+        "9,16": (1440, 2560),
+    },
+}
+
 VIEWPOINT_TEMPLATES: dict[str, str] = {
     "ego_view": "This video is captured from a first-person perspective looking at the scene.",
     "third_person_view": "This video is captured from a third-person perspective looking towards the agent from the front.",
     "wrist_view": "This video is captured from a wrist-mounted camera.",
     "concat_view": "This video contains concatenated views from multiple camera perspectives.",
+    "separate_camera_views": "The synchronized camera views are encoded separately, in a fixed camera order.",
+    "top_down_2d_view": "This video is captured from a top-down view of a flat 2D scene.",
+    "video_game_view": "This video is captured from an in-game camera perspective in a virtual environment.",
 }
 
 _STAT_KEYS = {"mean", "std", "min", "max", "q01", "q99"}
@@ -110,7 +189,7 @@ def get_raw_action_dim(embodiment: str) -> int:
 
 def canonical_aspect_ratio(width: int, height: int) -> str:
     """Canonical ``"W,H"`` aspect string for the action caption."""
-    for sizes in VIDEO_RES_SIZE_INFO.values():
+    for sizes in ASPECT_RATIO_SIZE_INFO.values():
         for aspect, (cand_w, cand_h) in sizes.items():
             if width == cand_w and height == cand_h:
                 return aspect
@@ -129,8 +208,16 @@ def build_action_prompt(
     fps: float,
     height: int,
     width: int,
+    format_prompt_as_json: bool = True,
 ) -> str | list[str]:
-    """Render the structured JSON action caption the action checkpoints expect."""
+    """Render the action caption the way native action inference does.
+
+    Mirrors ``_format_prompt`` / ``ActionPromptJsonFormatter`` of the native
+    action request builder: the stripped prompt becomes a sentence inside the
+    structured JSON caption (``json.dumps`` default separators); an unknown
+    viewpoint drops the framing; an empty prompt stays empty and plain-caption
+    requests (``format_prompt_as_json=False``) keep the prompt as given.
+    """
     duration_seconds = num_frames / fps
     minutes, secs = divmod(round(duration_seconds), 60)
     if isinstance(description, (list, tuple)):
@@ -139,21 +226,27 @@ def build_action_prompt(
         descriptions = [description]
 
     prompts = []
-    for desc in descriptions:
-        if desc and desc[-1] not in ".!?":
+    for raw in descriptions:
+        if not format_prompt_as_json:
+            prompts.append(raw)
+            continue
+        desc = raw.strip()
+        if not desc:
+            prompts.append(desc)
+            continue
+        if desc[-1] not in ".!?":
             desc = desc + "."
-        prompt = {
-            "cinematography": {
-                "framing": VIEWPOINT_TEMPLATES.get(
-                    view_point, VIEWPOINT_TEMPLATES["ego_view"]
-                )
-            },
-            "actions": [{"time": f"0:00-{minutes}:{secs:02d}", "description": desc}],
-            "duration": f"{int(duration_seconds)}s",
-            "fps": float(fps),
-            "resolution": {"H": int(height), "W": int(width)},
-            "aspect_ratio": canonical_aspect_ratio(int(width), int(height)),
-        }
+        prompt = {}
+        framing = VIEWPOINT_TEMPLATES.get(view_point)
+        if framing is not None:
+            prompt["cinematography"] = {"framing": framing}
+        prompt["actions"] = [
+            {"time": f"0:00-{minutes}:{secs:02d}", "description": desc}
+        ]
+        prompt["duration"] = f"{int(duration_seconds)}s"
+        prompt["fps"] = float(fps)
+        prompt["resolution"] = {"H": int(height), "W": int(width)}
+        prompt["aspect_ratio"] = canonical_aspect_ratio(int(width), int(height))
         prompts.append(json.dumps(prompt))
 
     if isinstance(description, (list, tuple)):

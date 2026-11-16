@@ -930,7 +930,9 @@ class TestCosmos3ActionEndpoint(unittest.TestCase):
         self.assertFalse(metadata["capabilities"]["openpi_websocket"])
         self.assertTrue(metadata["capabilities"]["batch_inputs"])
         self.assertEqual(metadata["capabilities"]["max_batch_size"], 4)
-        self.assertEqual(metadata["capabilities"]["batched_action_modes"], ["policy"])
+        self.assertEqual(
+            metadata["capabilities"]["batched_action_modes"], ["policy", "wam"]
+        )
 
     def test_metadata_keeps_batching_opt_in(self):
         metadata = action_metadata(_cosmos3_server_args())

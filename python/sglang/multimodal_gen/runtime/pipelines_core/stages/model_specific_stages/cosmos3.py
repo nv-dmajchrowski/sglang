@@ -63,9 +63,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding i
     streamed_video_output_path,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_action import (
+    ACTION_IMAGE_MODES,
     ACTION_MODE_FORWARD_DYNAMICS,
     ACTION_MODE_INVERSE_DYNAMICS,
-    ACTION_MODE_POLICY,
+    ACTION_MODE_WAM,
     ACTION_MODES,
     EMBODIMENT_TO_DOMAIN_ID,
     build_action_prompt,
@@ -315,8 +316,8 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
     """Load, aspect-resize, and center-crop the conditioning input.
 
     For I2V: writes ``[1, 3, H, W]`` to ``batch.preprocessed_image``. Batched
-    policy requests write ``[B, 3, H, W]``; regular visual generation remains
-    single-image conditioned.
+    policy / wam action requests write ``[B, 3, H, W]``; regular visual
+    generation remains single-image conditioned.
     For V2V: writes ``[1, 3, T_in, H, W]`` to ``batch.preprocessed_video``.
     For transfer: writes ``[1, 3, T, H, W]`` control pixels to
     ``batch.extra["preprocessed_control"]`` (independent of I2V / V2V).
@@ -466,12 +467,12 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         image_path = batch.image_path
         video_path = batch.video_path
-        is_action_policy = (
-            batch.data_type == DataType.ACTION
-            and getattr(batch.sampling_params, "action_mode", None)
-            == ACTION_MODE_POLICY
+        # policy and wam share the observation-image preprocessing, so the two
+        # modes see identical conditioning on every endpoint.
+        is_action_image = (
+            getattr(batch.sampling_params, "action_mode", None) in ACTION_IMAGE_MODES
         )
-        if isinstance(image_path, list) and not is_action_policy:
+        if isinstance(image_path, list) and not is_action_image:
             image_path = image_path[0] if image_path else None
         if isinstance(video_path, list):
             video_path = video_path[0] if video_path else None
@@ -740,9 +741,13 @@ class Cosmos3TokenizationStage(PipelineStage):
                 fps,
                 batch.height,
                 batch.width,
+                format_prompt_as_json=batch.sampling_params.format_prompt_as_json,
             )
             use_system_prompt = False
             use_duration_template = False
+            # Native action requests carry no negative caption, so the
+            # unconditional branch encodes the empty caption.
+            negative_prompt = batch.negative_prompt or ""
             self.log_info(f"Action prompt: {prompt}")
         else:
             structured_caption = _inject_caption_metadata(
@@ -2608,6 +2613,27 @@ class Cosmos3DecodingStage(PipelineStage):
             save_file_path, batch, finish_frames=self._postprocess_tensor
         )
 
+    def _decode_action_video(self, batch: Req) -> np.ndarray:
+        """The wam video of an action-payload request: uint8 ``[B, T, H, W, 3]``."""
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            with (
+                torch.no_grad(),
+                use_vae_fast_path(
+                    self.vae,
+                    quality_allows(batch.sampling_params.quality, "lossless"),
+                ),
+            ):
+                video = self._postprocess_tensor(self._decode_latents(batch.latents))
+        frames = (video * 255).clamp_(0, 255).to(torch.uint8)
+        frames = frames.permute(0, 2, 3, 4, 1).cpu().numpy()
+        if self._guardrails and batch.use_guardrails is not False:
+            from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_guardrails import (
+                check_video_safety,
+            )
+
+            frames = check_video_safety(frames)
+        return frames
+
     @staticmethod
     def _postprocess_video_np(video: torch.Tensor, is_image_gen: bool) -> np.ndarray:
         if is_image_gen:
@@ -2692,6 +2718,10 @@ class Cosmos3DecodingStage(PipelineStage):
                     "num_frames": batch.num_frames,
                 },
             }
+            if action_metadata["action_mode"] == ACTION_MODE_WAM:
+                frames = self._decode_action_video(batch)
+                payload["video"] = frames[0] if frames.shape[0] == 1 else frames
+                payload["fps"] = batch.fps
             return OutputBatch(
                 output=[payload],
                 action_pred=action_pred,

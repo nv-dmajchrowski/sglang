@@ -54,12 +54,12 @@ def cosmos3_action_metadata(server_args: ServerArgs) -> dict[str, Any]:
             "fps": 5,
         },
         "capabilities": {
-            "action_modes": ["policy", "inverse_dynamics"],
+            "action_modes": ["policy", "wam", "inverse_dynamics"],
             "realtime_websocket": True,
             "openpi_websocket": False,
             "batch_inputs": max_batch_size > 1,
             "max_batch_size": max_batch_size,
-            "batched_action_modes": ["policy"],
+            "batched_action_modes": ["policy", "wam"],
             "multiple_candidates": False,
         },
     }
@@ -137,11 +137,12 @@ def build_cosmos3_action_sampling_params(
         raise ValueError(
             "Cosmos3 forward_dynamics produces video; use /v1/videos instead"
         )
-    if action_mode not in ("policy", "inverse_dynamics"):
+    if action_mode not in ("policy", "wam", "inverse_dynamics"):
         raise ValueError(
-            "Cosmos3 action endpoint supports action_mode='policy' or "
+            "Cosmos3 action endpoint supports action_mode='policy', 'wam' or "
             "'inverse_dynamics'"
         )
+    observation_image_mode = action_mode in ("policy", "wam")
 
     action_horizon = options.get("action_horizon")
     num_frames = options.get("num_frames")
@@ -170,8 +171,8 @@ def build_cosmos3_action_sampling_params(
 
     images = _images_from_observation(observation)
     video_path = options.get("video_path") or observation.get("video")
-    if action_mode == "policy" and not images:
-        raise ValueError("Cosmos3 policy input requires an observation image")
+    if observation_image_mode and not images:
+        raise ValueError(f"Cosmos3 {action_mode} input requires an observation image")
     if action_mode == "inverse_dynamics" and video_path is None:
         raise ValueError("Cosmos3 inverse_dynamics input requires an observation video")
     if images and video_path is not None:
@@ -196,7 +197,7 @@ def build_cosmos3_action_sampling_params(
     prompt = observation.get("prompt")
     if prompt is None:
         prompt = observation.get("task", "")
-    if action_mode != "policy" and not isinstance(prompt, str):
+    if not observation_image_mode and not isinstance(prompt, str):
         raise ValueError("Cosmos3 inverse_dynamics prompt must be a string")
     prompt = _action_prompt(prompt, batch_size)
     sampling_kwargs = {
@@ -226,6 +227,8 @@ def build_cosmos3_action_sampling_params(
         "use_duration_template": False,
         "use_system_prompt": False,
         "use_guardrails": options.get("use_guardrails"),
+        "format_prompt_as_json": options.get("format_prompt_as_json"),
+        "return_action_payload": True,
         "save_output": False,
         "return_file_paths_only": False,
         "return_frames": False,

@@ -1572,7 +1572,8 @@ class SamplingParams:
             dest="action_mode",
             help=(
                 "Cosmos3 action mode: 'forward_dynamics' (predict next frame "
-                "from action), 'policy' (predict action from frame), or "
+                "from action), 'policy' (predict action from frame), 'wam' "
+                "(predict video and action from frame), or "
                 "'inverse_dynamics' (predict action from two frames)."
             ),
         )

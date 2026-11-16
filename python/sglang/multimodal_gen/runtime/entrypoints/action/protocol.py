@@ -507,6 +507,7 @@ def action_generation_response(
             f"{tuple(action_array.shape)}"
         )
 
+    videos = _batched_videos(output.get("video"), len(action_array))
     data = []
     for input_index, action_values in enumerate(action_array):
         action_shape = list(action_values.shape)
@@ -521,14 +522,17 @@ def action_generation_response(
         for name in ("action_mode", "domain_id", "raw_action_dim"):
             if output.get(name) is not None:
                 action[name] = output[name]
-        data.append(
-            {
-                "index": input_index,
-                "input_index": input_index,
-                "candidate_index": 0,
-                "action": action,
-            }
-        )
+        item = {
+            "index": input_index,
+            "input_index": input_index,
+            "candidate_index": 0,
+            "action": action,
+        }
+        if videos is not None:
+            item["video"] = _video_item(
+                videos[input_index], output.get("fps"), preserve_numpy
+            )
+        data.append(item)
 
     action_shape = data[0]["action"]["shape"]
 
@@ -566,13 +570,39 @@ def action_generation_response(
     return response
 
 
+def _batched_videos(video: Any, batch_size: int) -> np.ndarray | None:
+    """wam frames as uint8 ``[B, T, H, W, 3]``; ``None`` for action-only modes."""
+    if video is None:
+        return None
+    video = np.asarray(video)
+    if video.ndim == 4:
+        video = video[None]
+    if video.ndim != 5 or video.shape[0] != batch_size:
+        raise ValueError(
+            "wam video output must have shape [T, H, W, 3] or [B, T, H, W, 3] "
+            f"matching {batch_size} action chunk(s), got {tuple(video.shape)}"
+        )
+    return video
+
+
+def _video_item(frames: np.ndarray, fps: Any, preserve_numpy: bool) -> dict[str, Any]:
+    return {
+        "type": "video",
+        "dtype": str(frames.dtype),
+        "shape": list(frames.shape),
+        "fps": fps,
+        "values": frames if preserve_numpy else frames.tolist(),
+    }
+
+
 def action_raw_response(
     output: dict[str, Any],
     *,
     preserve_numpy: bool = False,
 ) -> dict[str, Any]:
     response = dict(output)
-    actions = response.get("actions")
-    if isinstance(actions, np.ndarray) and not preserve_numpy:
-        response["actions"] = actions.tolist()
+    for name in ("actions", "video"):
+        value = response.get(name)
+        if isinstance(value, np.ndarray) and not preserve_numpy:
+            response[name] = value.tolist()
     return response
