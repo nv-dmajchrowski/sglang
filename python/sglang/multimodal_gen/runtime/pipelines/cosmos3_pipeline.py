@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     Cosmos3TimestepPreparationStage,
     Cosmos3TokenizationStage,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_super_resolution import (
+    Cosmos3SuperResolutionStage,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
@@ -64,6 +67,7 @@ class Cosmos3Pipeline(LoRAPipeline, ComposedPipelineBase):
         1. Cosmos3ImagePreprocessStage - Load + aspect-resize the I2V image (no-op otherwise)
         2. Cosmos3TokenizationStage - Tokenize with Qwen2 chat template
         3. Cosmos3LatentPreparationStage - Noise latent (or image-conditioned for I2V)
+           + Cosmos3SuperResolutionStage - Supplied-LR prefix for LR-to-HR requests
         4. Cosmos3TimestepPreparationStage - Set up scheduler timesteps
         5. Cosmos3DenoisingStage - Dual-pathway denoising (UND once, GEN per step)
         6. Cosmos3DecodingStage - VAE decode to video, or to a single image for T2I
@@ -99,6 +103,7 @@ class Cosmos3Pipeline(LoRAPipeline, ComposedPipelineBase):
 
             self.add_stage(Cosmos3TextGuardrailStage())
         self.add_stage(Cosmos3LatentPreparationStage(vae, transformer))
+        self.add_stage(Cosmos3SuperResolutionStage(vae))
         self.add_stage(Cosmos3TimestepPreparationStage(scheduler))
         self.add_stage(
             Cosmos3DenoisingStage(

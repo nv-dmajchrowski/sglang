@@ -169,6 +169,7 @@ def compute_mrope_position_ids_vision(
     base_temporal_compression_factor: int | None = None,
     start_frame_offset: int = 0,
     temporal_position_period: int | None = None,
+    spatial_position_scale: tuple[float, float] | None = None,
 ) -> tuple[torch.Tensor, int | float]:
     """Generate 3D mRoPE position IDs for vision tokens.
 
@@ -181,6 +182,10 @@ def compute_mrope_position_ids_vision(
     cancel: action tokens run at frame rate (factor 1) while their temporal
     positions are scaled by the video factor. ``base_temporal_compression_factor``
     defaults to ``temporal_compression_factor`` so vision/sound are unchanged.
+
+    ``spatial_position_scale`` ``(scale_h, scale_w)`` places a coarser grid (the
+    LR item of a super-resolution request) in the patch coordinates of a finer
+    one: patch ``i`` sits at its center, ``(i + 0.5) * scale - 0.5``.
 
     Returns:
         (position_ids [3, grid_t * grid_h * grid_w], next_temporal_offset)
@@ -234,9 +239,24 @@ def compute_mrope_position_ids_vision(
         .flatten()
     )
 
-    if fps_modulation:
+    if spatial_position_scale is not None:
+        scale_h, scale_w = (float(scale) for scale in spatial_position_scale)
+        if not all(math.isfinite(scale) and scale > 0 for scale in (scale_h, scale_w)):
+            raise ValueError(
+                "spatial_position_scale must be finite and positive, "
+                f"got {spatial_position_scale}."
+            )
+        h_index = (h_index.to(torch.float32) + 0.5) * scale_h - 0.5
+        w_index = (w_index.to(torch.float32) + 0.5) * scale_w - 0.5
+
+    if fps_modulation or spatial_position_scale is not None:
         mrope_ids = torch.stack(
-            [t_index, h_index.to(torch.float32), w_index.to(torch.float32)], dim=0
+            [
+                t_index.to(torch.float32),
+                h_index.to(torch.float32),
+                w_index.to(torch.float32),
+            ],
+            dim=0,
         )
     else:
         mrope_ids = torch.stack([t_index, h_index, w_index], dim=0)
@@ -1435,13 +1455,20 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         control_frames: int | Sequence[int] = 0,
         share_vision_temporal_positions: bool = True,
         temporal_position_period: int | None = None,
+        control_grids: Sequence[tuple[int, int]] | None = None,
+        control_spatial_position_scales: (
+            Sequence[tuple[float, float] | None] | None
+        ) = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Compute mRoPE position IDs for UND text and GEN tokens.
 
         The GEN sequence is ordered ``[control, video, action, sound]``.
         Control and target videos either share matching temporal coordinates or
         occupy consecutive temporal ranges, according to
-        ``share_vision_temporal_positions``.
+        ``share_vision_temporal_positions``. ``control_grids`` gives each control
+        clip's own patch grid (default: the video's), and a non-``None`` entry
+        of ``control_spatial_position_scales`` maps that clip into the video's
+        patch coordinates.
         """
         B = text_mask.shape[0]
         S_text = text_mask.shape[1]
@@ -1456,7 +1483,26 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 else []
             )
         )
-        vision_frame_counts = [*control_frame_counts, T]
+        num_controls = len(control_frame_counts)
+        grids = (
+            [tuple(grid) for grid in control_grids]
+            if control_grids is not None
+            else [(Hp, Wp)] * num_controls
+        )
+        scales = (
+            list(control_spatial_position_scales)
+            if control_spatial_position_scales is not None
+            else [None] * num_controls
+        )
+        if len(grids) != num_controls or len(scales) != num_controls:
+            raise ValueError(
+                "control_grids and control_spatial_position_scales need one entry "
+                f"per control clip ({num_controls})."
+            )
+        vision_blocks = [
+            *zip(control_frame_counts, grids, scales),
+            (T, (Hp, Wp), None),
+        ]
 
         text_pos_list = []
         vis_pos_list = []
@@ -1468,20 +1514,21 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             media_offset = t_offset + self.temporal_margin
             vision_offset = media_offset
             vision_pos_blocks = []
-            for frame_count in vision_frame_counts:
+            for frame_count, (grid_h, grid_w), spatial_scale in vision_blocks:
                 temporal_offset = (
                     media_offset if share_vision_temporal_positions else vision_offset
                 )
                 vision_pos, vision_offset = compute_mrope_position_ids_vision(
                     frame_count,
-                    Hp,
-                    Wp,
+                    grid_h,
+                    grid_w,
                     temporal_offset=temporal_offset,
                     device=device,
                     fps=effective_fps,
                     base_fps=self.base_fps,
                     temporal_compression_factor=self.temporal_compression_factor,
                     temporal_position_period=temporal_position_period,
+                    spatial_position_scale=spatial_scale,
                 )
                 vision_pos_blocks.append(vision_pos)
 
@@ -1577,6 +1624,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         transfer_share_vision_temporal_positions: bool = True,
         temporal_position_period: int | None = None,
         multiview_layout: Any | None = None,
+        control_spatial_position_scales: (
+            Sequence[tuple[float, float] | None] | None
+        ) = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1620,6 +1670,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             multiview_layout: Opaque attention layout handed to each GEN
                 layer's cross-attention; only the multiview transformer
                 variant accepts it.
+            control_spatial_position_scales: Optional ``(scale_h, scale_w)``
+                per control clip. A scaled clip may have its own spatial size
+                (the LR item of a super-resolution request) and its patches
+                take fractional positions in the video's patch grid.
 
         Returns:
             [B, C, T, H, W] velocity prediction, or a tuple
@@ -1659,12 +1713,22 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 if isinstance(control_latents, (list, tuple))
                 else [control_latents]
             )
+        control_scales = (
+            list(control_spatial_position_scales)
+            if control_spatial_position_scales is not None
+            else [None] * len(control_clips)
+        )
+        if len(control_scales) != len(control_clips):
+            raise ValueError(
+                "control_spatial_position_scales needs one entry per control clip"
+            )
         control_frame_counts: list[int] = []
+        control_grids: list[tuple[int, int]] = []
         hidden_control_blocks: list[torch.Tensor] = []
         control_token_len = 0
-        for clip in control_clips:
+        for clip, spatial_scale in zip(control_clips, control_scales):
             _, _, c_frames, Hc, Wc = clip.shape
-            if (Hc, Wc) != (H, W):
+            if spatial_scale is None and (Hc, Wc) != (H, W):
                 raise ValueError(
                     "control_latents spatial dims "
                     f"{(Hc, Wc)} must match hidden_states {(H, W)}"
@@ -1674,6 +1738,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
             hidden_control_blocks.append(block)
             control_frame_counts.append(c_frames)
+            control_grids.append(self._pad_to_patch_size(Hc, Wc)[:2])
             control_token_len += block.shape[1]
         has_control = len(hidden_control_blocks) > 0
         hidden_control = (
@@ -1822,6 +1887,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                     transfer_share_vision_temporal_positions
                 ),
                 temporal_position_period=temporal_position_period,
+                control_grids=control_grids,
+                control_spatial_position_scales=control_scales,
             )
             # UND K/V cache is kept FULL on all ranks (not sharded). Text
             # sequence is short, so memory impact is minimal, and the GEN

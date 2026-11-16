@@ -74,6 +74,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     load_action_stats,
     normalize_action,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_super_resolution import (
+    SR_OUTPUT_SIZE_KEY,
+    adapt_super_resolution_output,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -2597,6 +2601,7 @@ class Cosmos3DecodingStage(PipelineStage):
             or (self.sound_tokenizer is not None and batch.audio_latents is not None)
             or batch.action_latents is not None
             or batch.extra.get("transfer_plan") is not None
+            or batch.extra.get(SR_OUTPUT_SIZE_KEY) is not None
         ):
             return None
         save_file_path = streamed_video_output_path(
@@ -2736,6 +2741,10 @@ class Cosmos3DecodingStage(PipelineStage):
                     **action_metadata,
                 )
 
+        sr_output = batch.extra.get(SR_OUTPUT_SIZE_KEY)
+        if sr_output is not None:
+            # The HR canvas keeps the LR bucket's bottom/right padding; keep only content.
+            decoded = adapt_super_resolution_output(decoded, sr_output)
         self.log_debug("Decoded tensor shape: %s", decoded.shape)
         output = self._postprocess_tensor(decoded)
         output = self._compose_transfer_display(output, batch)

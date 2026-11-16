@@ -20,6 +20,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.sample.cosmos3_super_resolution import (
+    Cosmos3SuperResolutionConfig,
+    load_super_resolution_config,
+)
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 COSMOS3_EDGE_BACKBONE_TYPE = "cosmos3_edge_nemotron_dense"
@@ -89,6 +93,19 @@ def _distilled_sampler_config(model_path: str) -> dict | None:
     return sampler
 
 
+def _super_resolution_config(model_path: str) -> Cosmos3SuperResolutionConfig:
+    """SR routes from the root ``config.json`` (``model.config.high_resolution``)."""
+    if not os.path.exists(model_path) and not os.path.isabs(model_path):
+        from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import (
+            maybe_download_model,
+        )
+
+        model_path = maybe_download_model(
+            model_path, allow_patterns=["config.json", "scheduler/*"]
+        )
+    return load_super_resolution_config(model_path)
+
+
 def get_distilled_sigmas(model_path: str) -> list[float] | None:
     """The explicit fixed-step sigma schedule for a distilled checkpoint."""
     sampler = _distilled_sampler_config(model_path)
@@ -146,6 +163,8 @@ class Cosmos3Config(PipelineConfig):
     is_edge: bool | None = None
     is_nano: bool | None = None
     distilled_sigmas: list[float] | None = None
+    # LR-to-HR routes declared by the checkpoint's root config.json.
+    super_resolution: Cosmos3SuperResolutionConfig | None = None
 
     def __post_init__(self):
         self.vae_config.arch_config.z_dim = 48
@@ -166,6 +185,7 @@ class Cosmos3Config(PipelineConfig):
             self.distilled_sigmas = get_distilled_sigmas(self.model_path)
             self.is_edge = is_edge_checkpoint(self.model_path)
             self.is_nano = is_nano_checkpoint(self.model_path)
+            self.super_resolution = _super_resolution_config(self.model_path)
             if self.distilled_sigmas is not None:
                 self.scheduler_class_override = None
 

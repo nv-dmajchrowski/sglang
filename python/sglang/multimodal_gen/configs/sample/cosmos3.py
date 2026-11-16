@@ -13,6 +13,12 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from sglang.multimodal_gen.configs.sample.cosmos3_super_resolution import (
+    SR_REQUEST_FIELDS,
+    bind_sr_flow_shift,
+    parse_size,
+    resolve_super_resolution_request,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -47,6 +53,14 @@ COSMOS3_EDGE_SUPPORTED_RESOLUTIONS = [
     (256, 448),
     (256, 256),
 ]
+
+
+def _probe_super_resolution_source_size(path: str) -> tuple[int, int]:
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_super_resolution import (
+        probe_super_resolution_source_size,
+    )
+
+    return probe_super_resolution_source_size(path)
 
 
 def _parse_request_value(value: Any) -> Any:
@@ -141,6 +155,22 @@ class Cosmos3SamplingParams(SamplingParams):
     show_input: bool = False
     share_vision_temporal_positions: bool = True
 
+    # LR-to-HR super-resolution (checkpoints that declare
+    # ``model.config.high_resolution`` routes). ``lr_vision_path`` is the LR
+    # image or ``.mp4`` video; ``width`` x ``height`` must be a declared HR
+    # canvas (e.g. 1920x1088). ``lr_resolution`` picks the LR tier when one HR
+    # tier has several; ``sr_modality`` names the route (text2image,
+    # image2image, text2video, image2video, video2video) and defaults to the
+    # LR media's own mode. ``resolution_adapter_policy`` ("cost_first" /
+    # "quality_first") maps an LR/output size no route declares onto one
+    # route, down-resizing outside the model; ``resolution_adapter_output_size``
+    # ("WxH") is the final size and defaults to the LR fitted into the canvas.
+    lr_vision_path: str | None = None
+    lr_resolution: str | None = None
+    sr_modality: str | None = None
+    resolution_adapter_policy: str | None = None
+    resolution_adapter_output_size: Any = None
+
     # Tuned per-hint defaults applied when exactly one control input is given
     # and the corresponding field was not set explicitly (mirrors the
     # cosmos-framework ``_TRANSFER_DEFAULTS`` table). ``shift`` maps to
@@ -201,6 +231,7 @@ class Cosmos3SamplingParams(SamplingParams):
                 "use_guardrails",
                 "use_resolution_template",
                 "use_system_prompt",
+                *SR_REQUEST_FIELDS,
             }
         )
 
@@ -401,6 +432,17 @@ class Cosmos3SamplingParams(SamplingParams):
             elif value is not None:
                 kwargs[name] = value
 
+        for name in SR_REQUEST_FIELDS:
+            value = kwargs.get(name)
+            if name == "resolution_adapter_output_size":
+                value = _parse_request_value(value)
+            if isinstance(value, str):
+                value = value.strip() or None
+            if value is None:
+                kwargs.pop(name, None)
+            else:
+                kwargs[name] = value
+
         hint = kwargs.get("control_hint")
         paths = kwargs.get("control_path")
         hints = [hint] if isinstance(hint, str) else list(hint or [])
@@ -414,6 +456,7 @@ class Cosmos3SamplingParams(SamplingParams):
         return kwargs
 
     def _adjust(self, server_args) -> None:
+        self._adjust_super_resolution(server_args.pipeline_config)
         if (
             self.task_type is None
             and self.num_frames == 1
@@ -533,6 +576,69 @@ class Cosmos3SamplingParams(SamplingParams):
                 self.width,
                 self.height,
             )
+
+    def _adjust_super_resolution(self, pipeline_config) -> None:
+        """Bind an LR-to-HR request to one declared route of the checkpoint.
+
+        The HR canvas becomes ``width`` x ``height`` and sampling uses the
+        checkpoint's inference shift. An image2video source image belongs to
+        the pass that made the LR and is dropped from the HR pass.
+        """
+        if (self.width is None) != (self.height is None):
+            hr_size = None
+            if self.lr_vision_path is not None:
+                raise ValueError("SR requests must set both width and height.")
+        elif self.width is None:
+            hr_size = None
+        else:
+            hr_size = (int(self.width), int(self.height))
+            if self.lr_vision_path is None and min(hr_size) > 0:
+                # Ordinary requests are floored to the latent grid later
+                # (_align_resolution); check the size they will run at.
+                m = COSMOS3_SIZE_MULTIPLE
+                hr_size = (max(m, hr_size[0] // m * m), max(m, hr_size[1] // m * m))
+        output_size = parse_size(self.resolution_adapter_output_size)
+        resolved = resolve_super_resolution_request(
+            pipeline_config.super_resolution,
+            lr_vision_path=self.lr_vision_path,
+            lr_resolution=(
+                str(self.lr_resolution) if self.lr_resolution is not None else None
+            ),
+            sr_modality=self.sr_modality,
+            hr_size=hr_size,
+            num_frames=int(self.num_frames),
+            num_frames_explicit=self.is_explicit("num_frames"),
+            image_path=self.image_path,
+            video_path=self.video_path,
+            condition_frame_indexes=self.condition_frame_indexes,
+            control_paths=self._resolve_control_paths(),
+            sound_duration=float(self.sound_duration or 0.0),
+            action_mode=self.action_mode,
+            rollout=bool(self.rollout),
+            resolution_adapter_policy=self.resolution_adapter_policy,
+            resolution_adapter_output_size=output_size,
+            probe_source_size=_probe_super_resolution_source_size,
+        )
+        if resolved is None:
+            return
+        plan, adapter = resolved
+        if adapter is not None:
+            self.resolution_adapter_output_size = adapter.requested_output_size
+        self.width, self.height = plan.hr_size
+        self.num_frames = plan.num_frames
+        self.lr_resolution = plan.lr_resolution
+        self.sr_modality = plan.modality
+        self.flow_shift = bind_sr_flow_shift(
+            pipeline_config.super_resolution,
+            requested_flow_shift=self.flow_shift,
+            flow_shift_explicit=self.is_explicit("flow_shift"),
+        )
+        if plan.modality == "image2video":
+            self.image_path = None
+            self.condition_frame_indexes = None
+        # The declared frame count is exact; GPU-count alignment must not move it.
+        self.adjust_frames = False
+        self.supported_resolutions = None
 
     def _validate(self) -> None:
         super()._validate()
