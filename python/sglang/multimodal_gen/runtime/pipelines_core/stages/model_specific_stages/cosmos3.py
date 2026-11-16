@@ -74,6 +74,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     load_action_stats,
     normalize_action,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_editing import (
+    COSMOS3_EDIT_FIRST_FRAME_KEY,
+    COSMOS3_EDIT_PLAN_KEY,
+    COSMOS3_EDIT_SOURCE_KEY,
+    edit_caption_metadata,
+    prepare_edit_inputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -464,6 +471,14 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        if getattr(batch.sampling_params, "edit_mode", None) is not None:
+            prepare_edit_inputs(batch)
+            self.log_info(
+                f"Prepared {batch.sampling_params.edit_mode} edit source "
+                f"{batch.num_frames}x{batch.height}x{batch.width}"
+            )
+            return batch
+
         image_path = batch.image_path
         video_path = batch.video_path
         is_action_policy = (
@@ -729,6 +744,11 @@ class Cosmos3TokenizationStage(PipelineStage):
         system_prompt = (
             COSMOS3_IMAGE_SYSTEM_PROMPT if is_image_gen else COSMOS3_VIDEO_SYSTEM_PROMPT
         )
+        edit_plan = batch.extra.get(COSMOS3_EDIT_PLAN_KEY)
+        if edit_plan is not None and edit_plan.system_prompt is not None:
+            # Edits always carry their editing system prompt; without one (an
+            # explicitly empty image-edit prompt) the generic policy applies.
+            use_system_prompt, system_prompt = True, edit_plan.system_prompt
 
         # Action mode uses a structured JSON caption with neither a system
         # prompt nor the duration suffix.
@@ -745,9 +765,18 @@ class Cosmos3TokenizationStage(PipelineStage):
             use_duration_template = False
             self.log_info(f"Action prompt: {prompt}")
         else:
-            structured_caption = _inject_caption_metadata(
-                prompt, num_frames, fps, batch.height, batch.width
-            )
+            if edit_plan is not None:
+                structured_caption = edit_caption_metadata(
+                    prompt,
+                    num_frames=num_frames,
+                    fps=fps,
+                    height=batch.height,
+                    width=batch.width,
+                )
+            else:
+                structured_caption = _inject_caption_metadata(
+                    prompt, num_frames, fps, batch.height, batch.width
+                )
             if structured_caption is not None:
                 # The metadata is already in the caption; appending the prose
                 # template too would state the duration twice.
@@ -930,7 +959,11 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         has_image_cond = batch.preprocessed_image is not None and uses_visual_latents
         has_video_cond = batch.preprocessed_video is not None and uses_visual_latents
 
-        if has_image_cond or has_video_cond:
+        if batch.extra.get(COSMOS3_EDIT_PLAN_KEY) is not None:
+            latents = self._prepare_edit_latents(
+                batch, noise, device=device, dtype=dtype
+            )
+        elif has_image_cond or has_video_cond:
             vae_dtype = next(self.vae.parameters()).dtype
 
             if has_video_cond:
@@ -1030,6 +1063,54 @@ class Cosmos3LatentPreparationStage(PipelineStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         return [ComponentUse(self._component_stage_name(stage_name), "vae")]
+
+    def _prepare_edit_latents(
+        self,
+        batch: Req,
+        noise: torch.Tensor,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Encode the edit source as the clean prefix item and return the target latents.
+
+        The source latent rides ``control_latents``, which the DiT packs ahead of
+        the target without a timestep embedding. An edited first frame conditions
+        target latent frame 0 the way I2V does; with the causal VAE it encodes
+        exactly as frame 0 of the cosmos-framework ``[edited, 0, ...]`` target.
+        """
+        vae_dtype = next(self.vae.parameters()).dtype
+        source = batch.extra.pop(COSMOS3_EDIT_SOURCE_KEY)
+        first_frame = batch.extra.pop(COSMOS3_EDIT_FIRST_FRAME_KEY, None)
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            with torch.no_grad():
+                source_latent = self._vae_encode(
+                    source.to(device=device, dtype=vae_dtype)
+                ).to(dtype)
+                first_latent = (
+                    None
+                    if first_frame is None
+                    else self._vae_encode(
+                        first_frame.unsqueeze(2).to(device=device, dtype=vae_dtype)
+                    ).to(dtype)
+                )
+        if source_latent.shape != noise.shape:
+            raise ValueError(
+                f"Edit source latent {tuple(source_latent.shape)} does not match the "
+                f"target latent {tuple(noise.shape)}"
+            )
+        batch.extra["control_latents"] = [source_latent]
+        if first_latent is None:
+            return noise
+        condition_mask = torch.zeros(
+            noise.shape[0], 1, noise.shape[2], 1, 1, device=device, dtype=dtype
+        )
+        condition_mask[:, :, 0] = 1.0
+        condition_latents = torch.zeros_like(noise)
+        condition_latents[:, :, :1] = first_latent
+        batch.extra["condition_latents"] = condition_latents
+        batch.extra["velocity_mask"] = 1.0 - condition_mask
+        return condition_mask * condition_latents + (1.0 - condition_mask) * noise
 
     @staticmethod
     def _resolve_domain_id(batch: Req) -> int:
@@ -1640,11 +1721,16 @@ class Cosmos3DenoisingStage(PipelineStage):
         generator: torch.Generator | None = None,
     ) -> Req:
         """Run one denoising loop with CFG and optional conditioning."""
-        self._share_vision_temporal_positions = bool(
-            getattr(
-                batch.sampling_params,
-                "share_vision_temporal_positions",
-                True,
+        edit_plan = batch.extra.get(COSMOS3_EDIT_PLAN_KEY)
+        self._share_vision_temporal_positions = (
+            edit_plan.share_temporal_positions
+            if edit_plan is not None
+            else bool(
+                getattr(
+                    batch.sampling_params,
+                    "share_vision_temporal_positions",
+                    True,
+                )
             )
         )
         self._extra_transformer_kwargs = dict(

@@ -13,6 +13,15 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
+from sglang.multimodal_gen.configs.sample.cosmos3_editing import (
+    COSMOS3_EDIT_DEFAULTS,
+    COSMOS3_VIDEO_EDIT_DEFAULTS,
+    EDIT_MODE_IMAGE,
+    normalize_edit_fields,
+    resolve_edit_mode,
+    resolve_edit_prompt,
+    validate_edit_request,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -189,6 +198,21 @@ class Cosmos3SamplingParams(SamplingParams):
     action_stats_path: str | None = None
     action_normalization: str = "quantile"
 
+    # Instruction editing (cosmos-framework ``image2image`` and ``video2video``
+    # with ``editing_instruction``). An input image with ``num_frames == 1``
+    # (task I2I) is an image edit; ``video_path`` with ``editing_instruction`` is
+    # a video edit. The instruction replaces the prompt and the output follows
+    # the source size, capped by ``max_pixels`` and rounded down to
+    # ``padding_constant``. ``edited_first_frame_path`` fixes video frame 0.
+    # ``system_prompt`` overrides the image-edit system prompt ("" disables it).
+    # ``edit_mode`` is resolved in ``_adjust``.
+    editing_instruction: str | None = None
+    edited_first_frame_path: str | None = None
+    system_prompt: str | None = None
+    max_pixels: int | None = None
+    padding_constant: int | None = None
+    edit_mode: str | None = None
+
     def is_explicit(self, name: str) -> bool:
         return self._explicit_fields is not None and name in self._explicit_fields
 
@@ -197,6 +221,9 @@ class Cosmos3SamplingParams(SamplingParams):
         return frozenset(
             {
                 "guidance_interval",
+                "max_pixels",
+                "padding_constant",
+                "system_prompt",
                 "use_duration_template",
                 "use_guardrails",
                 "use_resolution_template",
@@ -230,6 +257,8 @@ class Cosmos3SamplingParams(SamplingParams):
                 "control_path",
                 "domain_id",
                 "domain_name",
+                "edited_first_frame_path",
+                "editing_instruction",
                 "generate_sound",
                 "guardrails",
                 "max_frames",
@@ -401,6 +430,8 @@ class Cosmos3SamplingParams(SamplingParams):
             elif value is not None:
                 kwargs[name] = value
 
+        cls._lower_editing_request_kwargs(request, kwargs)
+
         hint = kwargs.get("control_hint")
         paths = kwargs.get("control_path")
         hints = [hint] if isinstance(hint, str) else list(hint or [])
@@ -413,6 +444,75 @@ class Cosmos3SamplingParams(SamplingParams):
                 kwargs["fps"] = defaults["fps"]
         return kwargs
 
+    @staticmethod
+    def _lower_editing_request_kwargs(request: Any, kwargs: dict[str, Any]) -> None:
+        if kwargs.get("editing_instruction") is None or not kwargs.get("video_path"):
+            return
+        # The HTTP layer fills fps and num_frames with generic video defaults. A
+        # video edit uses its own clock; its length comes from the source, so
+        # ``seconds`` does not apply and num_frames only caps the source length.
+        defaults = COSMOS3_VIDEO_EDIT_DEFAULTS
+        if request.fps is None:
+            kwargs["fps"] = defaults.fps
+        if request.num_frames is None:
+            kwargs["num_frames"] = defaults.num_frames
+
+    def _resolve_editing(self, is_distilled: bool) -> None:
+        """Resolve the edit mode, validate the request, and apply the editing recipe.
+
+        Runs before the variant and base defaults, so an unset size still means
+        "follow the source".
+        """
+        normalize_edit_fields(self)
+        task_type = (
+            ModelTaskType.parse(self.task_type) if self.task_type is not None else None
+        )
+        self.edit_mode = resolve_edit_mode(
+            is_image_task=task_type is not None and task_type.is_image_gen(),
+            has_image=bool(self.image_path),
+            has_video=bool(self.video_path),
+            editing_instruction=self.editing_instruction,
+        )
+        validate_edit_request(
+            edit_mode=self.edit_mode,
+            params=self,
+            control_paths=self._resolve_control_paths(),
+            size_multiple=COSMOS3_SIZE_MULTIPLE,
+        )
+        if self.edit_mode is None:
+            return
+        self.prompt = resolve_edit_prompt(self.prompt, self.editing_instruction)
+        defaults = COSMOS3_EDIT_DEFAULTS[self.edit_mode]
+        recipe: dict[str, Any] = {
+            # The editing captions carry no metadata sentences.
+            "use_duration_template": False,
+            "use_resolution_template": False,
+            "guidance_interval": None,
+            "max_pixels": defaults.max_pixels,
+            "padding_constant": defaults.padding_constant,
+        }
+        if not is_distilled:
+            recipe.update(
+                num_inference_steps=defaults.num_inference_steps,
+                guidance_scale=defaults.guidance_scale,
+                flow_shift=defaults.flow_shift,
+            )
+        if self.edit_mode != EDIT_MODE_IMAGE:
+            recipe.update(fps=defaults.fps, num_frames=defaults.num_frames)
+            if self.height is not None:
+                raise ValueError(
+                    "Cosmos3 video editing derives the output size from the source; "
+                    "use max_pixels to bound it"
+                )
+            # The output length comes from the source, not from GPU alignment.
+            self.adjust_frames = False
+        for name, value in recipe.items():
+            if not self.is_explicit(name):
+                setattr(self, name, value)
+        if self.height is None:
+            # Keep the base adjustment from filling a default resolution.
+            self.supported_resolutions = None
+
     def _adjust(self, server_args) -> None:
         if (
             self.task_type is None
@@ -422,6 +522,16 @@ class Cosmos3SamplingParams(SamplingParams):
             and self.action_mode is None
         ):
             self.task_type = ModelTaskType.T2I
+        elif (
+            self.task_type is None
+            and self.num_frames == 1
+            and self.image_path
+            and self.video_path is None
+            and self.action_mode is None
+            and not self._resolve_control_paths()
+        ):
+            # An image in and one frame out is cosmos-framework image2image.
+            self.task_type = ModelTaskType.I2I
 
         # adjust distil and edge args — read from the pre-computed config fields
         # so no checkpoint download happens at request time.
@@ -429,6 +539,7 @@ class Cosmos3SamplingParams(SamplingParams):
         if self.action_stats_path is None:
             self.action_stats_path = getattr(pipeline_config, "action_stats_path", None)
         distilled_sigmas = pipeline_config.distilled_sigmas
+        self._resolve_editing(is_distilled=distilled_sigmas is not None)
         if distilled_sigmas is not None:
             self.num_inference_steps = len(distilled_sigmas)
         self._resolve_variant_defaults(
@@ -582,7 +693,10 @@ class Cosmos3SamplingParams(SamplingParams):
         if is_distilled:
             # Guidance is distilled into the model; run a single forward.
             self.guidance_scale = 1.0
-        elif is_edge and not self._guidance_is_explicit():
+        if self.edit_mode is not None:
+            # Edits keep the editing recipe and the source size.
+            return
+        if not is_distilled and is_edge and not self._guidance_is_explicit():
             self.guidance_scale = (
                 COSMOS3_EDGE_T2I_GUIDANCE_SCALE
                 if is_t2i

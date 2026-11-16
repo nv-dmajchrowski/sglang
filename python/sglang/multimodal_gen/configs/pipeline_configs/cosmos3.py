@@ -107,11 +107,13 @@ class Cosmos3Config(PipelineConfig):
 
     # TI2V (text + image → video) so the request validator accepts ``image_path``
     # without requiring it. T2V ignores it; I2V uses it; T2I disregards it.
+    # I2I is instruction image editing; V2V covers video editing.
     task_type: ModelTaskType = ModelTaskType.TI2V
     supported_task_types: ClassVar[tuple[ModelTaskType, ...]] = (
         ModelTaskType.TI2V,
         ModelTaskType.T2I,
         ModelTaskType.V2V,
+        ModelTaskType.I2I,
     )
 
     dit_config: DiTConfig = field(default_factory=Cosmos3VideoConfig)

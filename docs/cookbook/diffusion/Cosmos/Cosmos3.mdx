@@ -356,6 +356,32 @@ job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
 
 Poll and download this job with the same status and content endpoints used by the T2V example.
 
+### Instruction editing
+
+Cosmos3.5 checkpoints trained on editing data edit an image or a video from a text instruction. The source is packed as a clean item ahead of the generated output, as in native Cosmos3 inference. The released Cosmos3 checkpoints accept these requests but are not trained to follow edit instructions.
+
+Image editing uses `/v1/images/edits`, and the prompt is the instruction. The output keeps the source aspect ratio, capped at 1 MP and rounded down to multiples of 32 (`max_pixels`, `padding_constant`). With `size`, the source is instead resized and center-cropped to that size.
+
+```bash Command
+curl -sS -X POST http://127.0.0.1:30010/v1/images/edits \
+  --form-string "prompt=Make the car red." \
+  --form "image=@street.jpg;type=image/jpeg" \
+  --form-string "response_format=b64_json" \
+  | python -c 'import base64, json, sys; open("edited.png", "wb").write(base64.b64decode(json.load(sys.stdin)["data"][0]["b64_json"]))'
+```
+
+Video editing uses `/v1/videos` with a source video and `editing_instruction`; repeat the instruction as the prompt. The output follows the source at 16 FPS, up to 81 frames (`num_frames` caps the length), capped at 512x512 pixels and rounded down to multiples of 16. `edited_first_frame_path`, a server-side image path, fixes output frame 0 to an already edited frame.
+
+```bash Command
+job_id=$(curl -sS -X POST http://127.0.0.1:30010/v1/videos \
+  --form-string "prompt=Turn the scene into a snowy night." \
+  --form-string "editing_instruction=Turn the scene into a snowy night." \
+  --form "video_reference=@street.mp4;type=video/mp4" \
+  | python -c 'import json, sys; print(json.load(sys.stdin)["id"])')
+```
+
+Poll and download this job with the same status and content endpoints used by the T2V example. Image edits default to 50 steps, `guidance_scale=4.0` and `flow_shift=3.0`; video edits to 35 steps, `guidance_scale=7.0` and `flow_shift=5.0`. Edit prompts carry no duration suffix, and the negative prompt defaults to empty.
+
 ### Action generation
 
 For DROID policy generation, start a server with either the Nano or Edge policy checkpoint. One GPU is enough; to split a request across GPUs, use Ulysses sequence parallelism (`--num-gpus 2 --ulysses-degree 2`). Cosmos3 action generation does not support CFG parallel; policy requests run with `guidance_scale=1.0`, so this only matters if you raise the guidance scale on a multi-GPU server.
@@ -465,6 +491,10 @@ Cosmos3 omnimodal fields are accepted as extra JSON fields or multipart form fie
 - `action_fps`: action-token frame rate for temporal mRoPE; defaults to the video FPS.
 - `action_view_point`: viewpoint used in the structured action caption.
 - `action_normalization`: dataset normalization mode, such as `quantile`, `meanstd`, or `minmax`.
+- `editing_instruction`: the edit to apply to the source video; makes a video request a video edit.
+- `edited_first_frame_path`: server-side image fixed as output frame 0 of a video edit.
+- `max_pixels` / `padding_constant`: pixel budget and size multiple (a multiple of 16) of an edit's output; also accepted by `/v1/images/edits`.
+- `system_prompt`: image-edit system prompt; an empty string disables it. Also accepted by `/v1/images/edits`.
 
 Pass model-specific controls through `extra_body` with the OpenAI Python SDK.
 Raw JSON may keep them at the top level; multipart video requests should put

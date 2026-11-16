@@ -296,6 +296,91 @@ def test_cosmos3_sampling_resolves_existing_modes(frames, conditioning, task, tm
     assert config.task_type == Task.TI2V
 
 
+@pytest.mark.parametrize(
+    "http_client", [(Cosmos3Config, Cosmos3SamplingParams)], indirect=True
+)
+def test_cosmos3_image_edits_select_instruction_editing(http_client, monkeypatch):
+    client, admitted, config = http_client
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **kw: Cosmos3SamplingParams()),
+    )
+    response = client.post(
+        "/v1/images/edits",
+        data={
+            "prompt": "Make the sky purple.",
+            "response_format": "b64_json",
+            "system_prompt": "",
+            "max_pixels": "921600",
+            "padding_constant": "16",
+        },
+        files={"image": ("image.png", png_bytes(), "image/png")},
+    )
+    assert response.status_code == 200, response.text
+    req = admitted[-1]
+    assert (req.task_type, req.data_type) == (Task.I2I, DataType.IMAGE)
+    assert req.edit_mode == "image"
+    assert req.num_inference_steps == 50
+    assert (req.guidance_scale, req.flow_shift) == (4.0, 3.0)
+    # Model-declared form extras reach the request; the size follows the source.
+    assert (req.system_prompt, req.max_pixels, req.padding_constant) == ("", 921600, 16)
+    assert (req.width, req.height) == (None, None)
+    assert config.task_type == Task.TI2V
+
+
+@pytest.mark.parametrize(
+    "http_client", [(Cosmos3Config, Cosmos3SamplingParams)], indirect=True
+)
+@pytest.mark.parametrize("multipart", [False, True])
+def test_cosmos3_video_edit_request(http_client, multipart, monkeypatch):
+    client, admitted, _ = http_client
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **kw: Cosmos3SamplingParams()),
+    )
+    payload = {
+        # The prompt may repeat the instruction; the endpoint requires one.
+        "prompt": "Change the pitcher to red.",
+        "video_path": "/tmp/clip.mp4",
+        "editing_instruction": "Change the pitcher to red.",
+        "edited_first_frame_path": "/tmp/edited.png",
+    }
+    if multipart:
+        response = client.post(
+            "/v1/videos", files={k: (None, v) for k, v in payload.items()}
+        )
+    else:
+        response = client.post("/v1/videos", json=payload)
+    assert response.status_code == 200, response.text
+    req = admitted[-1]
+    assert (req.task_type, req.edit_mode) == (Task.V2V, "video")
+    assert req.prompt == "Change the pitcher to red."
+    assert req.edited_first_frame_path == "/tmp/edited.png"
+    assert (req.fps, req.num_frames, req.guidance_scale) == (16, 81, 7.0)
+
+
+@pytest.mark.parametrize(
+    "http_client", [(Cosmos3Config, Cosmos3SamplingParams)], indirect=True
+)
+def test_cosmos3_edit_fields_without_an_edit_are_client_errors(
+    http_client, monkeypatch
+):
+    client, admitted, _ = http_client
+    monkeypatch.setattr(
+        SamplingParams,
+        "from_pretrained",
+        classmethod(lambda cls, *a, **kw: Cosmos3SamplingParams()),
+    )
+    response = client.post(
+        "/v1/videos",
+        json={"prompt": "a cat", "editing_instruction": "Make it red."},
+    )
+    assert response.status_code == 400, response.text
+    assert admitted == []
+
+
 def test_image_json_and_multipart_choose_tasks_on_video_default(http_client):
     client, admitted, config = http_client
     response = client.post(
